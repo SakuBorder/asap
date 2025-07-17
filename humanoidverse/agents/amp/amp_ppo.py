@@ -13,6 +13,15 @@ class AMPPPO(PPO):
     def _setup_models_and_optimizer(self):
         super()._setup_models_and_optimizer()
         
+        # 确保 algo_obs_dim_dict 中包含 amp_obs
+        if "amp_obs" not in self.algo_obs_dim_dict:
+            logger.warning("algo_obs_dim_dict中没有amp_obs，正在添加...")
+            # 计算AMP观测维度: dof_pos + dof_vel + base_lin_vel + base_ang_vel
+            dof_obs_size = self.env.config.robot.dof_obs_size
+            amp_obs_dim = 2 * dof_obs_size + 6  # dof_pos + dof_vel + 3 + 3
+            self.algo_obs_dim_dict["amp_obs"] = amp_obs_dim
+            logger.info(f"自动添加amp_obs维度: {amp_obs_dim}")
+        
         # 添加AMP判别器
         self.discriminator = AMPDiscriminator(
             self.algo_obs_dim_dict,
@@ -31,10 +40,28 @@ class AMPPPO(PPO):
         
         # 注册 amp_obs 存储
         try:
-            self.storage.register_key('amp_obs', shape=(self.algo_obs_dim_dict["amp_obs"],), dtype=torch.float)
-            logger.info(f"注册AMP观测存储，维度: {self.algo_obs_dim_dict['amp_obs']}")
-        except (AssertionError, KeyError) as e:
-            logger.warning(f"AMP观测存储注册失败: {e}")
+            # 确保维度存在
+            if "amp_obs" not in self.algo_obs_dim_dict:
+                dof_obs_size = self.env.config.robot.dof_obs_size
+                amp_obs_dim = 2 * dof_obs_size + 6
+                self.algo_obs_dim_dict["amp_obs"] = amp_obs_dim
+                logger.info(f"在存储设置阶段添加amp_obs维度: {amp_obs_dim}")
+            
+            amp_obs_dim = self.algo_obs_dim_dict["amp_obs"]
+            self.storage.register_key('amp_obs', shape=(amp_obs_dim,), dtype=torch.float)
+            logger.info(f"成功注册AMP观测存储，维度: {amp_obs_dim}")
+            
+        except Exception as e:
+            logger.error(f"AMP观测存储注册失败: {e}")
+            # 强制添加维度并重试
+            dof_obs_size = self.env.config.robot.dof_obs_size
+            amp_obs_dim = 2 * dof_obs_size + 6
+            self.algo_obs_dim_dict["amp_obs"] = amp_obs_dim
+            try:
+                self.storage.register_key('amp_obs', shape=(amp_obs_dim,), dtype=torch.float)
+                logger.info(f"重试成功，注册AMP观测存储，维度: {amp_obs_dim}")
+            except Exception as e2:
+                logger.error(f"重试也失败: {e2}")
 
     def _init_loss_dict_at_training_step(self):
         loss_dict = super()._init_loss_dict_at_training_step()
@@ -58,9 +85,22 @@ class AMPPPO(PPO):
                 # 获取AMP观测
                 if hasattr(self.env, '_compute_amp_observations'):
                     amp_obs = self.env._compute_amp_observations()
+                    logger.debug(f"从环境获取AMP观测，形状: {amp_obs.shape}")
+                elif hasattr(self.env, '_get_obs_amp_obs'):
+                    amp_obs = self.env._get_obs_amp_obs()
+                    logger.debug(f"使用_get_obs_amp_obs获取AMP观测，形状: {amp_obs.shape}")
+                elif 'amp_obs' in obs_dict:
+                    amp_obs = obs_dict['amp_obs']
+                    logger.debug(f"从obs_dict获取AMP观测，形状: {amp_obs.shape}")
                 else:
-                    # Fallback: 从obs_dict中获取amp_obs
-                    amp_obs = obs_dict.get('amp_obs', torch.zeros(self.num_envs, self.algo_obs_dim_dict["amp_obs"], device=self.device))
+                    # Fallback: 构造临时AMP观测
+                    logger.warning("无法获取AMP观测，使用临时构造的观测")
+                    dof_pos = self.env.simulator.dof_pos
+                    dof_vel = self.env.simulator.dof_vel
+                    base_lin_vel = self.env.base_lin_vel
+                    base_ang_vel = self.env.base_ang_vel
+                    amp_obs = torch.cat([dof_pos, dof_vel, base_lin_vel, base_ang_vel], dim=-1)
+                    logger.debug(f"构造的AMP观测形状: {amp_obs.shape}")
                 
                 policy_state_dict["amp_obs"] = amp_obs
 
@@ -71,6 +111,9 @@ class AMPPPO(PPO):
                 for obs_ in policy_state_dict.keys():
                     if obs_ in self.storage.stored_keys:  # 只存储已注册的键
                         self.storage.update_key(obs_, policy_state_dict[obs_])
+                    else:
+                        if obs_ == "amp_obs":
+                            logger.warning(f"amp_obs未在存储中注册，跳过存储")
                     
                 actions = policy_state_dict["actions"]
                 actor_state = {"actions": actions}
@@ -81,17 +124,20 @@ class AMPPPO(PPO):
                 rewards, dones = rewards.to(self.device), dones.to(self.device)
 
                 # 计算AMP奖励
+                amp_reward_computed = False
                 try:
                     amp_rewards = self.discriminator.compute_disc_rewards(amp_obs)
                     amp_rewards = amp_rewards * self.config.amp_reward_weight
                     
                     # 添加AMP奖励到总奖励
                     rewards += amp_rewards
+                    amp_reward_computed = True
                     
                     # 记录AMP奖励到日志 - 确保所有值都是tensor
                     if "to_log" not in infos:
                         infos["to_log"] = {}
                     infos["to_log"]["amp_reward_mean"] = torch.tensor(amp_rewards.mean().item(), device=self.device, dtype=torch.float)
+                    infos["to_log"]["amp_reward_active"] = torch.tensor(1.0, device=self.device, dtype=torch.float)
                     
                 except Exception as e:
                     logger.warning(f"计算AMP奖励时出错: {e}")
@@ -99,6 +145,7 @@ class AMPPPO(PPO):
                     if "to_log" not in infos:
                         infos["to_log"] = {}
                     infos["to_log"]["amp_reward_mean"] = torch.tensor(0.0, device=self.device, dtype=torch.float)
+                    infos["to_log"]["amp_reward_active"] = torch.tensor(0.0, device=self.device, dtype=torch.float)
 
                 # 确保infos["to_log"]中的所有值都是tensor
                 if "to_log" in infos:
@@ -164,6 +211,12 @@ class AMPPPO(PPO):
             loss_dict = self._update_discriminator(policy_state_dict, loss_dict)
         else:
             logger.warning("policy_state_dict中没有amp_obs，跳过判别器更新")
+            # 添加默认值到loss_dict
+            loss_dict['Discriminator_Loss'] += 0.0
+            loss_dict['Discriminator_Real_Acc'] += 0.5
+            loss_dict['Discriminator_Fake_Acc'] += 0.5
+            loss_dict['Discriminator_Total_Acc'] += 0.5
+            loss_dict['AMP_Reward_Mean'] += 0.0
             
         return loss_dict
 
@@ -176,6 +229,7 @@ class AMPPPO(PPO):
             # 检查环境是否有get_expert_amp_observations方法
             if hasattr(self.env, 'get_expert_amp_observations'):
                 real_amp_obs = self.env.get_expert_amp_observations(num_samples=batch_size)
+                logger.debug(f"获取专家AMP观测，形状: {real_amp_obs.shape}")
             else:
                 logger.warning("环境没有get_expert_amp_observations方法，使用随机数据")
                 amp_obs_dim = self.algo_obs_dim_dict["amp_obs"]
