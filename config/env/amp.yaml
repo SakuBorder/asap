@@ -1,0 +1,86 @@
+# @package _global_
+
+defaults:
+  - legged_base
+
+# Env structure
+env:
+  _target_: humanoidverse.envs.amp.amp_env.LeggedRobotAMP  # 修改为AMP环境类
+  config:
+    max_episode_length_s: 20
+    
+    # AMP特有配置
+    discriminator_replay_size: 100000  # 判别器回放缓冲区大小
+    discriminator_replay_keep_prob: 0.5  # 回放缓冲区保留概率
+    discriminator_batch_size: 512  # 判别器批次大小
+    discriminator_reward_w: 0.5  # AMP奖励权重
+    discriminator_grad_penalty: 10  # 梯度惩罚系数
+    discriminator_weight_decay: 0.0001  # 权重衰减
+    discriminator_logit_weight_decay: 0.01  # Logit层权重衰减
+    num_discriminator_mini_epochs: 1  # 判别器训练轮数
+    discriminator_grad_clip: 1.0  # 梯度裁剪值
+    
+    # 历史观察配置
+    num_historical_steps: 2  # 历史步数
+    
+    # Motion library配置
+    robot:
+      motion:
+        step_dt: ${dt}  # 确保与环境dt一致
+        # 其他motion相关配置...
+    
+    # 原有的终止条件配置
+    termination:
+      terminate_by_contact: False
+      terminate_by_gravity: True
+      terminate_by_low_height: False
+      terminate_when_motion_end: True
+      terminate_when_motion_far: False
+      terminate_when_close_to_dof_pos_limit: False
+      terminate_when_close_to_dof_vel_limit: False
+      terminate_when_close_to_torque_limit: False
+    
+    termination_scales:
+      termination_min_base_height: 0.2
+      termination_gravity_x: 0.8
+      termination_gravity_y: 0.8
+      termination_motion_far_threshold: 1.5
+      termination_close_to_dof_pos_limit: 0.98
+      termination_close_to_dof_vel_limit: 0.98
+      termination_close_to_torque_limit: 0.98
+    
+    termination_probality:
+      terminate_when_close_to_dof_pos_limit: 0.25
+      terminate_when_close_to_dof_vel_limit: 0.25
+      terminate_when_close_to_torque_limit: 0.25
+    termination_curriculum:
+      terminate_when_motion_far_curriculum: False
+      terminate_when_motion_far_initial_threshold: 1.5
+      terminate_when_motion_far_threshold_max: 2.0
+      terminate_when_motion_far_threshold_min: 0.25
+      terminate_when_motion_far_curriculum_degree: 0.0000025
+      terminate_when_motion_far_curriculum_level_down_threshold: 40
+      terminate_when_motion_far_curriculum_level_up_threshold: 42
+
+    resample_motion_when_training: True
+    resample_time_interval_s: 2000
+    
+    noise_to_initial_level: 0
+    init_noise_scale: 
+      dof_pos: 0.1
+      dof_vel: 0.15
+      root_pos: 0.05
+      root_rot: 10
+      root_vel: 0.01
+      root_ang_vel: 0.01
+    
+    use_teleop_control: False
+    enforce_randomize_motion_start_eval: False
+
+# Globally accessible parameters
+log_task_name: amp_motion
+
+eval_overrides:
+  env:
+    config: 
+      max_episode_length_s: 100000

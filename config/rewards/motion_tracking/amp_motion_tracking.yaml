@@ -1,0 +1,98 @@
+# @package _global_
+
+defaults:
+  - motion_tracking/reward_motion_tracking_dm_2real_tai5
+
+rewards:
+  # 继承motion tracking奖励，但调整权重以平衡AMP
+  reward_scales:
+    # Motion tracking奖励（稍微降低权重给AMP让路）
+    teleop_body_position_extend: 0.8
+    teleop_vr_3point: 1.2
+    teleop_body_position_feet: 1.5
+    teleop_body_rotation_extend: 0.4
+    teleop_body_ang_velocity_extend: 0.4
+    teleop_body_velocity_extend: 0.4
+    teleop_joint_position: 0.6
+    teleop_joint_velocity: 0.4
+    
+    # 惩罚项（保持原有）
+    penalty_torques: -0.000001
+    penalty_action_rate: -0.3  # 稍微增加，鼓励平滑动作
+    penalty_feet_ori: -1.5
+    feet_heading_alignment: -0.08
+    penalty_slippage: -0.8
+    limits_dof_pos: -8.0
+    limits_dof_vel: -4.0
+    limits_torque: -4.0
+    termination: -150.0
+
+  # AMP相关配置
+  amp_reward_weight: 0.5  # AMP奖励权重
+  
+  # 其他参数保持不变
+  teleop_body_pos_lowerbody_weight: 0.5
+  teleop_body_pos_upperbody_weight: 1.0
+  desired_feet_max_height_for_this_air: 0.2
+
+  reward_tracking_sigma:
+    teleop_upper_body_pos: 0.03
+    teleop_lower_body_pos: 0.1
+    teleop_vr_3point_pos: 0.03
+    teleop_feet_pos: 0.03
+    teleop_body_rot: 1.0
+    teleop_body_vel: 1.0
+    teleop_body_ang_vel: 1.0
+    teleop_joint_pos: 1.0
+    teleop_joint_vel: 1.0
+
+  # 课程学习配置
+  reward_penalty_curriculum: True
+  reward_initial_penalty_scale: 0.10
+  reward_min_penalty_scale: 0.0
+  reward_max_penalty_scale: 1.0
+  reward_penalty_level_down_threshold: 40
+  reward_penalty_level_up_threshold: 42
+  reward_penalty_degree: 0.000003
+  num_compute_average_epl: 10000
+
+  reward_limit:
+    soft_dof_pos_limit: 0.9
+    soft_dof_vel_limit: 0.9
+    soft_torque_limit: 0.825
+
+    reward_limits_curriculum:
+      soft_dof_pos_curriculum: True
+      soft_dof_pos_initial_limit: 1.15
+      soft_dof_pos_max_limit: 1.15
+      soft_dof_pos_min_limit: 0.95
+      soft_dof_pos_curriculum_degree: 0.00000025
+      soft_dof_pos_curriculum_level_down_threshold: 40
+      soft_dof_pos_curriculum_level_up_threshold: 42
+
+      soft_dof_vel_curriculum: True
+      soft_dof_vel_initial_limit: 1.15
+      soft_dof_vel_max_limit: 1.25
+      soft_dof_vel_min_limit: 0.95
+      soft_dof_vel_curriculum_degree: 0.00000025
+      soft_dof_vel_curriculum_level_down_threshold: 40
+      soft_dof_vel_curriculum_level_up_threshold: 42
+
+      soft_torque_curriculum: True
+      soft_torque_initial_limit: 1.15
+      soft_torque_max_limit: 1.25
+      soft_torque_min_limit: 0.85
+      soft_torque_curriculum_degree: 0.00000025
+      soft_torque_curriculum_level_down_threshold: 40
+      soft_torque_curriculum_level_up_threshold: 42
+
+  reward_penalty_reward_names: [
+    "penalty_torques",
+    "penalty_action_rate",
+    "limits_dof_pos",
+    "limits_dof_vel",
+    "limits_torque",
+    "feet_heading_alignment",
+    "penalty_feet_ori",
+    "penalty_slippage"
+  ]

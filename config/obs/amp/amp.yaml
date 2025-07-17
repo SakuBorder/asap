@@ -1,0 +1,76 @@
+# @package _global_
+
+obs:
+  obs_dict:
+    actor_obs: [
+      base_lin_vel,
+      base_ang_vel,
+      projected_gravity,
+      dof_pos,
+      dof_vel,
+      actions,
+      # AMP不需要显式的参考动作观察
+      # 判别器会隐式学习动作分布
+    ]
+    
+    critic_obs: [
+      base_lin_vel,
+      base_ang_vel,
+      projected_gravity,
+      dof_pos,
+      dof_vel,
+      actions,
+      # 可以添加AMP奖励作为critic的额外信息
+      amp_rewards,
+    ]
+    
+    # 用于判别器的历史观察
+    historical_self_obs: [
+      dof_pos,
+      dof_vel,
+      base_lin_vel,
+      base_ang_vel,
+      projected_gravity,
+    ]
+  
+  obs_auxiliary:
+    # 历史数据用于时序信息
+    history: {
+      dof_pos: 5,
+      dof_vel: 5,
+      actions: 5,
+    }
+  
+  obs_scales: {
+    base_lin_vel: 2.0,
+    base_ang_vel: 0.25,
+    projected_gravity: 1.0,
+    dof_pos: 1.0,
+    dof_vel: 0.05,
+    history: 1.0,
+    actions: 1.0,
+    amp_rewards: 1.0,
+  }
+  
+  noise_scales: {
+    base_lin_vel: 0.1,
+    base_ang_vel: 0.2,
+    projected_gravity: 0.05,
+    dof_pos: 0.01,
+    dof_vel: 1.5,
+    actions: 0.0,
+    history: 0.0,
+    amp_rewards: 0.0,
+  }
+  
+  obs_dims:
+    - base_lin_vel: 3
+    - base_ang_vel: 3
+    - projected_gravity: 3
+    - dof_pos: ${robot.dof_obs_size}
+    - dof_vel: ${robot.dof_obs_size}
+    - actions: ${robot.dof_obs_size}
+    - amp_rewards: 1
+    - historical_self_obs: ${eval:'3 + 3 + 3 + ${robot.dof_obs_size} + ${robot.dof_obs_size}'}  # 用于判别器
+  
+  post_compute_config: {}

@@ -1,0 +1,25 @@
+# @package _global_
+
+defaults:
+  - motion_tracking/reward_motion_tracking_dm_2real_tai5
+
+rewards:
+  # 调整原有奖励权重，让AMP风格奖励起主导作用
+  reward_scales:
+    # 降低任务奖励权重
+    teleop_body_position_extend: 0.5
+    teleop_vr_3point: 0.8
+    teleop_body_position_feet: 1.0
+    teleop_joint_position: 0.375
+    
+    # 添加AMP奖励
+    amp_discriminator_reward: 2.0
+    
+    # 保持原有惩罚项
+    penalty_action_rate: -0.5
+    penalty_feet_ori: -2.0
+    penalty_slippage: -1.0
+    limits_dof_pos: -10.0
+    limits_dof_vel: -5.0
+    limits_torque: -5.0
+    termination: -200.0
