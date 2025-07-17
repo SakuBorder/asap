@@ -1,0 +1,65 @@
+# @package _global_
+
+algo:
+  _target_: humanoidverse.agents.amp.amp_ppo.AMPPPO
+  _recursive_: False
+  config:
+    # PPO基础参数
+    num_learning_epochs: 5
+    num_mini_batches: 4
+    clip_param: 0.2
+    gamma: 0.99
+    lam: 0.95
+    value_loss_coef: 1.0
+    entropy_coef: 0.01
+    actor_learning_rate: 1.e-3
+    critic_learning_rate: 1.e-3
+    max_grad_norm: 1.0
+    use_clipped_value_loss: True
+    schedule: "adaptive"
+    desired_kl: 0.01
+
+    # AMP特定参数
+    discriminator_learning_rate: 5.e-4
+    amp_reward_weight: 0.5
+    discriminator_update_freq: 1
+    generator_update_freq: 1
+    use_adaptive_weights: True
+    min_amp_weight: 0.1
+    max_amp_weight: 2.0
+
+    # 训练参数
+    num_steps_per_env: 24
+    save_interval: 100
+    load_optimizer: True
+    init_noise_std: 0.8
+    num_learning_iterations: 1000000
+    init_at_random_ep_len: True
+    eval_callbacks: null
+
+    module_dict:
+      actor: 
+        input_dim: [actor_obs]
+        output_dim: [robot_action_dim]
+        layer_config:
+          type: MLP
+          hidden_dims: [512, 256, 128]
+          activation: ELU
+          
+      critic: 
+        input_dim: [critic_obs]
+        output_dim: [1]
+        layer_config:
+          type: MLP
+          hidden_dims: [512, 256, 128]
+          activation: ELU
+          
+      discriminator:
+        input_dim: [amp_obs]
+        output_dim: [1]
+        layer_config:
+          type: MLP
+          hidden_dims: [1024, 512, 256, 128]
+          activation: ELU
+        gradient_penalty_weight: 10.0
+        use_spectral_norm: False
