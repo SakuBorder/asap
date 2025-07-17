@@ -80,8 +80,6 @@ class AMPPPO(PPO):
                     obs_dict[obs_key] = obs_dict[obs_key].to(self.device)
                 rewards, dones = rewards.to(self.device), dones.to(self.device)
 
-                self.episode_env_tensors.add(infos["to_log"])
-                
                 # 计算AMP奖励
                 try:
                     amp_rewards = self.discriminator.compute_disc_rewards(amp_obs)
@@ -90,13 +88,34 @@ class AMPPPO(PPO):
                     # 添加AMP奖励到总奖励
                     rewards += amp_rewards
                     
-                    # 记录AMP奖励到日志
+                    # 记录AMP奖励到日志 - 确保所有值都是tensor
                     if "to_log" not in infos:
                         infos["to_log"] = {}
-                    infos["to_log"]["amp_reward_mean"] = amp_rewards.mean().item()
+                    infos["to_log"]["amp_reward_mean"] = torch.tensor(amp_rewards.mean().item(), device=self.device, dtype=torch.float)
                     
                 except Exception as e:
                     logger.warning(f"计算AMP奖励时出错: {e}")
+                    # 设置默认值
+                    if "to_log" not in infos:
+                        infos["to_log"] = {}
+                    infos["to_log"]["amp_reward_mean"] = torch.tensor(0.0, device=self.device, dtype=torch.float)
+
+                # 确保infos["to_log"]中的所有值都是tensor
+                if "to_log" in infos:
+                    for key, value in infos["to_log"].items():
+                        if isinstance(value, (int, float)):
+                            infos["to_log"][key] = torch.tensor(value, device=self.device, dtype=torch.float)
+                        elif isinstance(value, torch.Tensor):
+                            # 确保tensor在正确的设备上
+                            infos["to_log"][key] = value.to(self.device).float()
+                            # 如果是标量tensor，保持标量形状
+                            if len(infos["to_log"][key].shape) == 0:
+                                infos["to_log"][key] = infos["to_log"][key]
+                            elif len(infos["to_log"][key].shape) > 0:
+                                # 如果是多维tensor，取平均值变为标量
+                                infos["to_log"][key] = infos["to_log"][key].mean()
+
+                self.episode_env_tensors.add(infos["to_log"])
                 
                 rewards_stored = rewards.clone().unsqueeze(1)
                 if 'time_outs' in infos:
@@ -153,7 +172,15 @@ class AMPPPO(PPO):
         try:
             # 获取真实数据（专家演示）
             batch_size = policy_state_dict["amp_obs"].shape[0]
-            real_amp_obs = self.env.get_expert_amp_observations(num_samples=batch_size)
+            
+            # 检查环境是否有get_expert_amp_observations方法
+            if hasattr(self.env, 'get_expert_amp_observations'):
+                real_amp_obs = self.env.get_expert_amp_observations(num_samples=batch_size)
+            else:
+                logger.warning("环境没有get_expert_amp_observations方法，使用随机数据")
+                amp_obs_dim = self.algo_obs_dim_dict["amp_obs"]
+                real_amp_obs = torch.randn(batch_size, amp_obs_dim, device=self.device)
+            
             fake_amp_obs = policy_state_dict["amp_obs"]
             
             # 计算判别器损失
