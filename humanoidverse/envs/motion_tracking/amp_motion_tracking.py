@@ -52,24 +52,13 @@ class AMPMotionTracking(LeggedRobotMotionTracking):
         # 设置关键身体点索引（用于AMP观测）
         self._setup_key_body_ids()
         
-        # 仅初始化空缓冲，不加载 expert 数据
-        self._init_amp_buffer_only()
+        # 检查评估模式状态
+        logger.info(f"初始化完成后的评估模式状态: {getattr(self, 'is_evaluating', False)}")
         
+        # 延迟初始化AMP数据，等待 set_is_evaluating 调用
         self.amp_data_initialized = False
+        self._init_amp_data()
         self.init_done = True
-        amp_obs_dim = self.config.robot.algo_obs_dim_dict["amp_obs"]
-        self.expert_amp_loader = torch.zeros(1, amp_obs_dim, device=self.device)  # 或设置为 None 也行
-
-    def _init_amp_buffer_only(self):
-        """初始化AMP观测缓冲，并占位初始化 expert 数据"""
-        amp_obs_dim = self.config.robot.algo_obs_dim_dict["amp_obs"]
-        self.amp_obs_buf = torch.zeros(self.num_envs, amp_obs_dim, device=self.device)
-        
-        # 避免AMP PPO早期访问时报错
-        self.expert_amp_loader = torch.zeros(1, amp_obs_dim, device=self.device)
-
-        logger.info(f"AMP观测缓冲初始化完成，形状: {self.amp_obs_buf.shape}")
-
 
     def _fix_amp_obs_config(self, config):
         """修复AMP观测维度配置 - 参考标准实现"""
@@ -111,11 +100,13 @@ class AMPMotionTracking(LeggedRobotMotionTracking):
         
         # 检查当前是否为评估模式
         is_eval = getattr(self, 'is_evaluating', False)
+        logger.info(f"AMP数据初始化时的评估模式状态: {is_eval}")
+        
         if is_eval:
-            logger.info("AMP初始化：评估模式 -> 加载评估 expert 数据")
+            logger.info("初始化时检测到评估模式，加载expert数据")
             self.expert_amp_loader = self._load_expert_amp_data_for_eval()
         else:
-            logger.info("AMP初始化：训练模式 -> 加载完整 expert 数据")
+            logger.info("初始化时为训练模式，加载完整expert数据")
             self.expert_amp_loader = self._load_expert_amp_data_for_training()
         
         self.amp_data_initialized = True
@@ -392,17 +383,15 @@ class AMPMotionTracking(LeggedRobotMotionTracking):
         """设置为评估模式 - AMP特殊处理"""
         logger.info("🔄 AMPMotionTracking 切换到评估模式")
         
-        # 调用父类方法，设置 is_evaluating=True
+        # 调用父类方法
         super().set_is_evaluating()
         
-        # 仅在这里才加载 expert 数据（根据评估/训练模式）
+        # 重新配置AMP数据为评估模式
         if self.amp_data_initialized:
-            logger.info("AMP数据已初始化，重新加载评估模式 expert 数据")
+            logger.info("重新配置AMP数据为评估模式")
             self._reinit_amp_for_evaluation()
         else:
-            logger.info("AMP数据未初始化，首次加载 expert 数据")
-            self._init_amp_data()
-
+            logger.info("AMP数据尚未初始化，标记为稍后处理")
 
     def _log_amp_debug_info(self):
         """记录AMP调试信息"""
