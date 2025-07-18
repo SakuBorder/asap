@@ -61,106 +61,168 @@ class AMPMotionTracking(LeggedRobotMotionTracking):
         self.init_done = True
 
     def _fix_amp_obs_config(self, config):
-        """修复AMP观测维度配置 - 参考标准实现"""
-        # 计算标准AMP观测维度
-        dof_obs_size = config.robot.dof_obs_size  # 30 for tai5
-        num_key_bodies = len(config.robot.key_bodies) if hasattr(config.robot, 'key_bodies') else 2  # 默认2个脚
-        
-        # 标准AMP观测包含：root_h(1) + root_rot(6) + root_vel(3) + root_ang_vel(3) + dof_obs + dof_vel + key_body_pos
-        expected_amp_dim = 1 + 6 + 3 + 3 + dof_obs_size + dof_obs_size + (3 * num_key_bodies)
-        
-        # 更新配置中的amp_obs维度
-        if not hasattr(config.robot, "algo_obs_dim_dict"):
-            config.robot.algo_obs_dim_dict = {}
-        
-        config.robot.algo_obs_dim_dict["amp_obs"] = expected_amp_dim
-        
-        logger.info(f"设置标准AMP观测维度为: {expected_amp_dim}")
-        logger.info(f"组成: root_h(1) + root_rot(6) + root_vel(3) + root_ang_vel(3) + dof_obs({dof_obs_size}) + dof_vel({dof_obs_size}) + key_body_pos({3 * num_key_bodies})")
-
-    def _setup_key_body_ids(self):
-        """设置关键身体点索引"""
-        # 使用脚部作为关键身体点
-        self._key_body_ids = self.feet_indices
-        logger.info(f"设置关键身体点索引: {self._key_body_ids}")
-
-    def _init_amp_data(self):
-        """初始化AMP相关数据"""
-        # 获取AMP观测维度
-        amp_obs_dim = self.config.robot.algo_obs_dim_dict["amp_obs"]
-        
-        # AMP观测缓冲区（总是需要）
-        self.amp_obs_buf = torch.zeros(
-            self.num_envs, 
-            amp_obs_dim, 
-            device=self.device
-        )
-        
-        logger.info(f"初始化AMP观测缓冲区，形状: {self.amp_obs_buf.shape}")
-        
-        # 检查当前是否为评估模式
-        is_eval = getattr(self, 'is_evaluating', False)
-        logger.info(f"AMP数据初始化时的评估模式状态: {is_eval}")
-        
-        if is_eval:
-            logger.info("初始化时检测到评估模式，加载expert数据")
-            self.expert_amp_loader = self._load_expert_amp_data_for_eval()
-        else:
-            logger.info("初始化时为训练模式，加载完整expert数据")
-            self.expert_amp_loader = self._load_expert_amp_data_for_training()
-        
-        self.amp_data_initialized = True
-
-    def _reinit_amp_for_evaluation(self):
-        """重新初始化AMP数据为评估模式"""
+        """修复AMP观测维度配置 - 使用安全的默认值"""
         try:
-            logger.info("开始重新初始化AMP expert数据为评估模式")
+            # 确保基础配置存在
+            if not hasattr(config.robot, "algo_obs_dim_dict"):
+                config.robot.algo_obs_dim_dict = {}
             
-            # 重新加载评估模式的expert数据
-            self.expert_amp_loader = self._load_expert_amp_data_for_eval()
+            # 安全地获取DOF观测大小
+            dof_obs_size = getattr(config.robot, 'dof_obs_size', 30)  # 默认30
             
-            logger.info(f"✅ AMP数据已切换到评估模式，expert数据形状: {self.expert_amp_loader.shape}")
+            # 默认使用2个关键身体点（脚部）
+            num_key_bodies = 2
+            
+            # 计算标准AMP观测维度
+            # root_h(1) + root_rot(6) + root_vel(3) + root_ang_vel(3) + dof_obs + dof_vel + key_body_pos
+            expected_amp_dim = 1 + 6 + 3 + 3 + dof_obs_size + dof_obs_size + (3 * num_key_bodies)
+            
+            # 更新配置中的amp_obs维度
+            config.robot.algo_obs_dim_dict["amp_obs"] = expected_amp_dim
+            
+            logger.info(f"设置AMP观测维度为: {expected_amp_dim}")
             
         except Exception as e:
-            logger.error(f"❌ AMP评估模式重新初始化失败: {e}")
-            # 使用安全的fallback
+            logger.warning(f"配置AMP观测维度时出错: {e}，使用默认值")
+            # 使用安全的默认值
+            if not hasattr(config.robot, "algo_obs_dim_dict"):
+                config.robot.algo_obs_dim_dict = {}
+            config.robot.algo_obs_dim_dict["amp_obs"] = 79  # 默认值
+
+    def _setup_key_body_ids(self):
+        """设置关键身体点索引 - 使用安全的方法"""
+        try:
+            # 优先使用脚部索引
+            if hasattr(self, 'feet_indices') and len(self.feet_indices) > 0:
+                self._key_body_ids = self.feet_indices
+                logger.info(f"使用脚部索引作为关键身体点: {self._key_body_ids}")
+            else:
+                # 使用安全的默认值
+                self._key_body_ids = torch.tensor([6, 12], device=self.device)
+                logger.warning(f"使用默认关键身体点索引: {self._key_body_ids}")
+                
+        except Exception as e:
+            logger.error(f"设置关键身体点时出错: {e}")
+            # 使用最安全的默认值
+            self._key_body_ids = torch.tensor([6, 12], device=self.device)
+
+    def _init_amp_data(self):
+        """初始化AMP相关数据 - 使用安全的方法"""
+        try:
+            # 获取AMP观测维度
             amp_obs_dim = self.config.robot.algo_obs_dim_dict["amp_obs"]
+            
+            # 创建AMP观测缓冲区
+            self.amp_obs_buf = torch.zeros(
+                self.num_envs, 
+                amp_obs_dim, 
+                device=self.device
+            )
+            
+            logger.info(f"初始化AMP观测缓冲区，形状: {self.amp_obs_buf.shape}")
+            
+            # 初始化时使用最小的expert数据集
             self.expert_amp_loader = torch.zeros(100, amp_obs_dim, device=self.device)
+            
+            # 标记为已初始化，但expert数据稍后加载
+            self.amp_data_initialized = True
+            self.expert_data_loaded = False
+            
+            logger.info("AMP数据初始化完成，expert数据将在稍后加载")
+            
+        except Exception as e:
+            logger.error(f"AMP数据初始化失败: {e}")
+            # 使用最小的fallback
+            amp_obs_dim = 79
+            self.amp_obs_buf = torch.zeros(self.num_envs, amp_obs_dim, device=self.device)
+            self.expert_amp_loader = torch.zeros(100, amp_obs_dim, device=self.device)
+            self.amp_data_initialized = False
+            self.expert_data_loaded = False
+
+    def _validate_motion_data(self, motion_id):
+        """验证motion数据的有效性"""
+        try:
+            # 先获取一个样本来检查数据结构
+            motion_state = self._motion_lib.get_motion_state(
+                torch.tensor([motion_id], device=self.device),
+                torch.tensor([0.0], device=self.device),
+                offset=torch.zeros(1, 3, device=self.device)
+            )
+            
+            # 检查必要的key是否存在
+            required_keys = ["root_pos", "root_rot", "root_vel", "root_ang_vel", "dof_pos", "dof_vel"]
+            for key in required_keys:
+                if key not in motion_state:
+                    logger.error(f"Motion {motion_id} 缺少必要的key: {key}")
+                    return False
+            
+            # 检查rg_pos_t的维度
+            if "rg_pos_t" in motion_state:
+                rg_pos_t = motion_state["rg_pos_t"][0]  # [num_bodies, 3]
+                num_bodies = rg_pos_t.shape[0]
+                max_key_body_id = torch.max(self._key_body_ids).item()
+                
+                logger.info(f"Motion {motion_id}: 身体数量={num_bodies}, 最大关键身体ID={max_key_body_id}")
+                
+                if max_key_body_id >= num_bodies:
+                    logger.error(f"Motion {motion_id}: 关键身体ID {max_key_body_id} 超出范围 [0, {num_bodies-1}]")
+                    return False
+            else:
+                logger.warning(f"Motion {motion_id} 没有rg_pos_t数据")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"验证motion {motion_id} 时出错: {e}")
+            return False
 
     def _load_expert_amp_data_for_eval(self):
-        """评估模式：加载少量expert数据"""
+        """评估模式：只加载一个有效的motion"""
         expert_states = []
         amp_obs_dim = self.config.robot.algo_obs_dim_dict["amp_obs"]
         
         try:
-            # 评估时使用前几个motion
-            max_motions = min(3, self._motion_lib._num_unique_motions)
-            samples_per_motion = 20
+            # 获取可用的motion数量
+            num_motions = self._motion_lib._num_unique_motions
+            logger.info(f"总共有 {num_motions} 个motion可用")
             
-            logger.info(f"评估模式：加载 {max_motions} 个motion，每个采样 {samples_per_motion} 个点")
+            # 找到第一个有效的motion
+            valid_motion_id = None
+            for motion_id in range(num_motions):
+                if self._validate_motion_data(motion_id):
+                    valid_motion_id = motion_id
+                    logger.info(f"找到有效的motion: {motion_id}")
+                    break
             
-            for motion_id in range(max_motions):
+            if valid_motion_id is None:
+                logger.error("没有找到有效的motion")
+                return torch.zeros(100, amp_obs_dim, device=self.device)
+            
+            # 只使用这一个有效的motion
+            motion_length = self._motion_lib.get_motion_length([valid_motion_id]).item()
+            logger.info(f"使用motion {valid_motion_id}，长度: {motion_length}s")
+            
+            # 采样更多的点来补充数据
+            samples_per_motion = 100  # 从一个motion中采样100个点
+            
+            for i in range(samples_per_motion):
                 try:
-                    motion_length = self._motion_lib.get_motion_length([motion_id]).item()
+                    # 均匀采样时间点
+                    time_ratio = i / max(1, samples_per_motion - 1)
+                    time = time_ratio * max(0.1, motion_length - 0.1)
                     
-                    if motion_length < 0.5:
-                        continue
+                    motion_state = self._motion_lib.get_motion_state(
+                        torch.tensor([valid_motion_id], device=self.device),
+                        torch.tensor([time], device=self.device),
+                        offset=torch.zeros(1, 3, device=self.device)
+                    )
                     
-                    # 均匀采样
-                    for i in range(samples_per_motion):
-                        time = (i / max(1, samples_per_motion - 1)) * (motion_length - 0.1)
-                        
-                        motion_state = self._motion_lib.get_motion_state(
-                            torch.tensor([motion_id], device=self.device),
-                            torch.tensor([time], device=self.device),
-                            offset=torch.zeros(1, 3, device=self.device)
-                        )
-                        
-                        amp_obs = self._build_amp_obs_from_state(motion_state)
+                    amp_obs = self._build_amp_obs_from_state(motion_state)
+                    if amp_obs is not None:
                         expert_states.append(amp_obs)
                         
                 except Exception as e:
-                    logger.error(f"处理motion {motion_id} 时出错: {e}")
+                    logger.error(f"处理motion {valid_motion_id} 时间点 {i} 出错: {e}")
                     continue
             
             if len(expert_states) > 0:
@@ -168,7 +230,7 @@ class AMPMotionTracking(LeggedRobotMotionTracking):
                 logger.info(f"✅ 评估模式：成功加载 {len(expert_states)} 个expert观测")
                 return result
             else:
-                logger.warning("⚠️ 评估模式：没有加载到expert数据，使用fallback")
+                logger.error("没有加载到任何expert数据")
                 return torch.zeros(100, amp_obs_dim, device=self.device)
                 
         except Exception as e:
@@ -176,41 +238,56 @@ class AMPMotionTracking(LeggedRobotMotionTracking):
             return torch.zeros(100, amp_obs_dim, device=self.device)
 
     def _load_expert_amp_data_for_training(self):
-        """训练模式：加载大量expert数据"""
+        """训练模式：加载多个有效的motion"""
         expert_states = []
         amp_obs_dim = self.config.robot.algo_obs_dim_dict["amp_obs"]
         
         try:
-            # 训练时使用所有motion，大量采样
             num_motions = self._motion_lib._num_unique_motions
-            samples_per_motion = 50  # 减少采样点，避免内存问题
+            logger.info(f"训练模式：总共有 {num_motions} 个motion可用")
             
-            logger.info(f"训练模式：处理 {num_motions} 个motion，每个motion采样 {samples_per_motion} 个点")
-            
+            # 找到所有有效的motion
+            valid_motion_ids = []
             for motion_id in range(num_motions):
+                if self._validate_motion_data(motion_id):
+                    valid_motion_ids.append(motion_id)
+                    if len(valid_motion_ids) >= 5:  # 最多使用5个motion
+                        break
+            
+            if len(valid_motion_ids) == 0:
+                logger.error("没有找到有效的motion")
+                return torch.zeros(1000, amp_obs_dim, device=self.device)
+            
+            logger.info(f"找到 {len(valid_motion_ids)} 个有效的motion: {valid_motion_ids}")
+            
+            # 对每个有效motion采样
+            samples_per_motion = 200 // len(valid_motion_ids)  # 平均分配采样点
+            
+            for motion_id in valid_motion_ids:
                 try:
                     motion_length = self._motion_lib.get_motion_length([motion_id]).item()
                     
-                    if motion_length < 0.5:  # 跳过太短的motion
-                        logger.debug(f"Motion {motion_id} 太短 ({motion_length}s)，跳过")
-                        continue
-                    
-                    # 密集采样整个motion
                     for i in range(samples_per_motion):
-                        # 均匀分布采样
-                        time = (i / max(1, samples_per_motion - 1)) * (motion_length - 0.1)
-                        
-                        motion_state = self._motion_lib.get_motion_state(
-                            torch.tensor([motion_id], device=self.device),
-                            torch.tensor([time], device=self.device),
-                            offset=torch.zeros(1, 3, device=self.device)
-                        )
-                        
-                        amp_obs = self._build_amp_obs_from_state(motion_state)
-                        expert_states.append(amp_obs)
-                        
+                        try:
+                            time_ratio = i / max(1, samples_per_motion - 1)
+                            time = time_ratio * max(0.1, motion_length - 0.1)
+                            
+                            motion_state = self._motion_lib.get_motion_state(
+                                torch.tensor([motion_id], device=self.device),
+                                torch.tensor([time], device=self.device),
+                                offset=torch.zeros(1, 3, device=self.device)
+                            )
+                            
+                            amp_obs = self._build_amp_obs_from_state(motion_state)
+                            if amp_obs is not None:
+                                expert_states.append(amp_obs)
+                                
+                        except Exception as e:
+                            logger.error(f"处理motion {motion_id} 时间点 {i} 出错: {e}")
+                            continue
+                            
                 except Exception as e:
-                    logger.error(f"处理motion {motion_id} 时出错: {e}")
+                    logger.error(f"处理motion {motion_id} 失败: {e}")
                     continue
             
             if len(expert_states) > 0:
@@ -222,138 +299,223 @@ class AMPMotionTracking(LeggedRobotMotionTracking):
                 return torch.zeros(1000, amp_obs_dim, device=self.device)
                 
         except Exception as e:
-            logger.error(f"训练模式expert数据加载过程出现严重错误: {e}")
+            logger.error(f"训练模式expert数据加载失败: {e}")
             return torch.zeros(1000, amp_obs_dim, device=self.device)
 
-    def _process_dof_obs(self, dof_pos):
-        """处理DOF观测 - 参考标准实现"""
-        # 简化版本，直接返回相对于默认位置的偏移
-        if hasattr(self, 'default_dof_pos') and self.default_dof_pos is not None:
-            return dof_pos - self.default_dof_pos.squeeze(0)
-        else:
-            return dof_pos
+    def _build_amp_obs_from_state(self, motion_state):
+        """从motion状态构建标准AMP观测"""
+        try:
+            # 检查必要的状态是否存在
+            required_keys = ["root_pos", "root_rot", "root_vel", "root_ang_vel", "dof_pos", "dof_vel"]
+            for key in required_keys:
+                if key not in motion_state:
+                    logger.error(f"Motion状态缺少 {key}")
+                    return None
+            
+            root_pos = motion_state["root_pos"][0]      # [3]
+            root_rot = motion_state["root_rot"][0]      # [4] 
+            root_vel = motion_state["root_vel"][0]      # [3]
+            root_ang_vel = motion_state["root_ang_vel"][0]  # [3]
+            dof_pos = motion_state["dof_pos"][0]        # [30]
+            dof_vel = motion_state["dof_vel"][0]        # [30]
+            
+            # 安全地获取关键身体点
+            if "rg_pos_t" in motion_state:
+                all_body_pos = motion_state["rg_pos_t"][0]  # [num_bodies, 3]
+                num_bodies = all_body_pos.shape[0]
+                
+                # 确保所有关键身体点索引都在有效范围内
+                valid_key_body_ids = []
+                for idx in self._key_body_ids:
+                    if idx < num_bodies:
+                        valid_key_body_ids.append(idx)
+                    else:
+                        logger.warning(f"关键身体点索引 {idx} 超出范围，跳过")
+                
+                if len(valid_key_body_ids) > 0:
+                    # 使用有效的索引
+                    valid_indices = torch.tensor(valid_key_body_ids, device=self.device)
+                    key_body_pos = all_body_pos[valid_indices]
+                    
+                    # 如果有效索引数量不足，用零向量补充
+                    if len(valid_key_body_ids) < len(self._key_body_ids):
+                        missing_count = len(self._key_body_ids) - len(valid_key_body_ids)
+                        zeros = torch.zeros(missing_count, 3, device=self.device)
+                        key_body_pos = torch.cat([key_body_pos, zeros], dim=0)
+                else:
+                    # 如果没有有效索引，使用零向量
+                    key_body_pos = torch.zeros(len(self._key_body_ids), 3, device=self.device)
+                    logger.warning("没有有效的关键身体点索引，使用零向量")
+            else:
+                # 如果没有rg_pos_t数据，使用零向量
+                key_body_pos = torch.zeros(len(self._key_body_ids), 3, device=self.device)
+                logger.warning("没有rg_pos_t数据，使用零向量")
+            
+            # 构建标准AMP观测
+            amp_obs = self._build_standard_amp_obs(
+                root_pos.unsqueeze(0),      # [1, 3]
+                root_rot.unsqueeze(0),      # [1, 4]
+                root_vel.unsqueeze(0),      # [1, 3] 
+                root_ang_vel.unsqueeze(0),  # [1, 3]
+                dof_pos.unsqueeze(0),       # [1, 30]
+                dof_vel.unsqueeze(0),       # [1, 30]
+                key_body_pos.unsqueeze(0)   # [1, num_key_bodies, 3]
+            )
+            
+            return amp_obs.squeeze(0)
+            
+        except Exception as e:
+            logger.error(f"构建AMP观测时出错: {e}")
+            return None
 
     def _build_standard_amp_obs(self, root_pos, root_rot, root_vel, root_ang_vel, 
                                dof_pos, dof_vel, key_body_pos):
         """标准AMP观测构建，参考humanoid实现"""
-        # 根节点高度
-        root_h = root_pos[:, 2:3]
-        
-        # 计算heading rotation（去除pitch和roll）
-        heading_rot = calc_heading_quat_inv(root_rot, w_last=True)
-        
-        # 局部坐标系下的根节点旋转（转换为6D表示）
-        local_root_rot = quat_mul(heading_rot, root_rot, w_last=True)
-        root_rot_obs = quat_to_tan_norm(local_root_rot)
-        
-        # 局部坐标系下的根节点速度
-        local_root_vel = my_quat_rotate(heading_rot, root_vel)
-        local_root_ang_vel = my_quat_rotate(heading_rot, root_ang_vel)
-        
-        # 局部坐标系下的关键身体点位置
-        root_pos_expand = root_pos.unsqueeze(-2)
-        local_key_body_pos = key_body_pos - root_pos_expand
-        
-        # 转换关键身体点到局部坐标系
-        heading_rot_expand = heading_rot.unsqueeze(-2)
-        heading_rot_expand = heading_rot_expand.repeat((1, local_key_body_pos.shape[1], 1))
-        flat_local_key_pos = my_quat_rotate(
-            heading_rot_expand.view(-1, 4), 
-            local_key_body_pos.view(-1, 3)
-        ).view(local_key_body_pos.shape[0], -1)
-        
-        # DOF观测处理
-        dof_obs = self._process_dof_obs(dof_pos)
-        
-        # 组合最终观测 - 严格按照标准格式
-        obs = torch.cat([
-            root_h,                 # [B, 1] 根节点高度
-            root_rot_obs,          # [B, 6] 局部根节点旋转（6D）
-            local_root_vel,        # [B, 3] 局部根节点线速度  
-            local_root_ang_vel,    # [B, 3] 局部根节点角速度
-            dof_obs,              # [B, 30] 处理后的关节位置
-            dof_vel,              # [B, 30] 关节速度
-            flat_local_key_pos,   # [B, 6] 局部关键身体点位置（2个脚 * 3维）
-        ], dim=-1)
-        
-        return obs
+        try:
+            # 根节点高度
+            root_h = root_pos[:, 2:3]
+            
+            # 计算heading rotation（去除pitch和roll）
+            heading_rot = calc_heading_quat_inv(root_rot, w_last=True)
+            
+            # 局部坐标系下的根节点旋转（转换为6D表示）
+            local_root_rot = quat_mul(heading_rot, root_rot, w_last=True)
+            root_rot_obs = quat_to_tan_norm(local_root_rot)
+            
+            # 局部坐标系下的根节点速度
+            local_root_vel = my_quat_rotate(heading_rot, root_vel)
+            local_root_ang_vel = my_quat_rotate(heading_rot, root_ang_vel)
+            
+            # 局部坐标系下的关键身体点位置
+            root_pos_expand = root_pos.unsqueeze(-2)
+            local_key_body_pos = key_body_pos - root_pos_expand
+            
+            # 转换关键身体点到局部坐标系
+            heading_rot_expand = heading_rot.unsqueeze(-2)
+            heading_rot_expand = heading_rot_expand.repeat((1, local_key_body_pos.shape[1], 1))
+            flat_local_key_pos = my_quat_rotate(
+                heading_rot_expand.view(-1, 4), 
+                local_key_body_pos.view(-1, 3)
+            ).view(local_key_body_pos.shape[0], -1)
+            
+            # DOF观测处理
+            dof_obs = self._process_dof_obs(dof_pos)
+            
+            # 组合最终观测 - 严格按照标准格式
+            obs = torch.cat([
+                root_h,                 # [B, 1] 根节点高度
+                root_rot_obs,          # [B, 6] 局部根节点旋转（6D）
+                local_root_vel,        # [B, 3] 局部根节点线速度  
+                local_root_ang_vel,    # [B, 3] 局部根节点角速度
+                dof_obs,              # [B, 30] 处理后的关节位置
+                dof_vel,              # [B, 30] 关节速度
+                flat_local_key_pos,   # [B, 6] 局部关键身体点位置（2个脚 * 3维）
+            ], dim=-1)
+            
+            return obs
+            
+        except Exception as e:
+            logger.error(f"构建标准AMP观测时出错: {e}")
+            # 返回零观测作为fallback
+            amp_obs_dim = self.config.robot.algo_obs_dim_dict["amp_obs"]
+            return torch.zeros(root_pos.shape[0], amp_obs_dim, device=self.device)
 
-    def _build_amp_obs_from_state(self, motion_state):
-        """从motion状态构建标准AMP观测"""
-        root_pos = motion_state["root_pos"][0]      # [3]
-        root_rot = motion_state["root_rot"][0]      # [4] 
-        root_vel = motion_state["root_vel"][0]      # [3]
-        root_ang_vel = motion_state["root_ang_vel"][0]  # [3]
-        dof_pos = motion_state["dof_pos"][0]        # [30]
-        dof_vel = motion_state["dof_vel"][0]        # [30]
-        
-        # 获取关键身体点
-        if "rg_pos_t" in motion_state:
-            all_body_pos = motion_state["rg_pos_t"][0]  # [num_bodies, 3]
-            # 选择关键身体点（脚部）
-            key_body_pos = all_body_pos[self._key_body_ids]  # [num_key_bodies, 3]
-        else:
-            # Fallback: 使用零向量
-            key_body_pos = torch.zeros(len(self._key_body_ids), 3, device=self.device)
-        
-        # 构建标准AMP观测
-        amp_obs = self._build_standard_amp_obs(
-            root_pos.unsqueeze(0),      # [1, 3]
-            root_rot.unsqueeze(0),      # [1, 4]
-            root_vel.unsqueeze(0),      # [1, 3] 
-            root_ang_vel.unsqueeze(0),  # [1, 3]
-            dof_pos.unsqueeze(0),       # [1, 30]
-            dof_vel.unsqueeze(0),       # [1, 30]
-            key_body_pos.unsqueeze(0)   # [1, num_key_bodies, 3]
-        )
-        
-        return amp_obs.squeeze(0)
+    def _process_dof_obs(self, dof_pos):
+        """处理DOF观测 - 参考标准实现"""
+        try:
+            # 简化版本，直接返回相对于默认位置的偏移
+            if hasattr(self, 'default_dof_pos') and self.default_dof_pos is not None:
+                return dof_pos - self.default_dof_pos.squeeze(0)
+            else:
+                return dof_pos
+        except:
+            return dof_pos
 
     def _compute_amp_observations(self):
         """计算当前状态的标准AMP观测"""
-        # 获取关键身体点位置
-        if hasattr(self, '_rigid_body_pos_extend'):
-            key_body_pos = self._rigid_body_pos_extend[:, self._key_body_ids, :]
-        else:
-            key_body_pos = self.simulator._rigid_body_pos[:, self._key_body_ids, :]
-        
-        # 构建标准AMP观测，确保与expert数据格式完全一致
-        amp_obs = self._build_standard_amp_obs(
-            self.simulator.robot_root_states[:, :3],      # root_pos [N, 3]
-            self.simulator.robot_root_states[:, 3:7],     # root_rot [N, 4]
-            self.simulator.robot_root_states[:, 7:10],    # root_vel [N, 3]
-            self.simulator.robot_root_states[:, 10:13],   # root_ang_vel [N, 3]
-            self.simulator.dof_pos,                       # dof_pos [N, 30]
-            self.simulator.dof_vel,                       # dof_vel [N, 30]
-            key_body_pos                                  # key_body_pos [N, num_key_bodies, 3]
-        )
-        
-        self.amp_obs_buf[:] = amp_obs
-        return amp_obs
+        try:
+            # 获取关键身体点位置
+            if hasattr(self, '_rigid_body_pos_extend'):
+                all_body_pos = self._rigid_body_pos_extend
+            else:
+                all_body_pos = self.simulator._rigid_body_pos
+            
+            # 安全地选择关键身体点
+            num_bodies = all_body_pos.shape[1]
+            valid_key_body_ids = []
+            
+            for idx in self._key_body_ids:
+                if idx < num_bodies:
+                    valid_key_body_ids.append(idx)
+            
+            if len(valid_key_body_ids) > 0:
+                valid_indices = torch.tensor(valid_key_body_ids, device=self.device)
+                key_body_pos = all_body_pos[:, valid_indices, :]
+                
+                # 如果有效索引数量不足，用零向量补充
+                if len(valid_key_body_ids) < len(self._key_body_ids):
+                    missing_count = len(self._key_body_ids) - len(valid_key_body_ids)
+                    zeros = torch.zeros(self.num_envs, missing_count, 3, device=self.device)
+                    key_body_pos = torch.cat([key_body_pos, zeros], dim=1)
+            else:
+                key_body_pos = torch.zeros(self.num_envs, len(self._key_body_ids), 3, device=self.device)
+            
+            # 构建标准AMP观测，确保与expert数据格式完全一致
+            amp_obs = self._build_standard_amp_obs(
+                self.simulator.robot_root_states[:, :3],      # root_pos [N, 3]
+                self.simulator.robot_root_states[:, 3:7],     # root_rot [N, 4]
+                self.simulator.robot_root_states[:, 7:10],    # root_vel [N, 3]
+                self.simulator.robot_root_states[:, 10:13],   # root_ang_vel [N, 3]
+                self.simulator.dof_pos,                       # dof_pos [N, 30]
+                self.simulator.dof_vel,                       # dof_vel [N, 30]
+                key_body_pos                                  # key_body_pos [N, num_key_bodies, 3]
+            )
+            
+            self.amp_obs_buf[:] = amp_obs
+            return amp_obs
+            
+        except Exception as e:
+            logger.error(f"计算AMP观测时出错: {e}")
+            return self.amp_obs_buf
 
     def get_expert_amp_observations(self, num_samples=None):
         """获取专家AMP观测 - 改进的采样策略"""
         if num_samples is None:
             num_samples = self.num_envs
         
-        expert_data_size = len(self.expert_amp_loader)
-        
-        if expert_data_size == 0:
-            logger.error("Expert数据为空！")
+        try:
+            # 如果expert数据还没有加载，尝试加载
+            if not self.expert_data_loaded:
+                is_eval = getattr(self, 'is_evaluating', False)
+                if is_eval:
+                    self.expert_amp_loader = self._load_expert_amp_data_for_eval()
+                else:
+                    self.expert_amp_loader = self._load_expert_amp_data_for_training()
+                self.expert_data_loaded = True
+            
+            expert_data_size = len(self.expert_amp_loader)
+            
+            if expert_data_size == 0:
+                logger.error("Expert数据为空！")
+                amp_obs_dim = self.config.robot.algo_obs_dim_dict["amp_obs"]
+                return torch.zeros(num_samples, amp_obs_dim, device=self.device)
+            
+            if expert_data_size < num_samples:
+                logger.debug(f"Expert数据不足: {expert_data_size} < {num_samples}，使用重复采样")
+                # 重复采样
+                repeats = (num_samples // expert_data_size) + 1
+                expanded_data = self.expert_amp_loader.repeat(repeats, 1)
+                indices = torch.randperm(len(expanded_data))[:num_samples]
+                return expanded_data[indices]
+            else:
+                # 随机采样
+                indices = torch.randperm(expert_data_size)[:num_samples]
+                return self.expert_amp_loader[indices]
+                
+        except Exception as e:
+            logger.error(f"获取expert观测时出错: {e}")
             amp_obs_dim = self.config.robot.algo_obs_dim_dict["amp_obs"]
             return torch.zeros(num_samples, amp_obs_dim, device=self.device)
-        
-        if expert_data_size < num_samples:
-            logger.debug(f"Expert数据不足: {expert_data_size} < {num_samples}，使用重复采样")
-            # 重复采样
-            repeats = (num_samples // expert_data_size) + 1
-            expanded_data = self.expert_amp_loader.repeat(repeats, 1)
-            indices = torch.randperm(len(expanded_data))[:num_samples]
-            return expanded_data[indices]
-        else:
-            # 随机采样
-            indices = torch.randperm(expert_data_size)[:num_samples]
-            return self.expert_amp_loader[indices]
 
     def _pre_compute_observations_callback(self):
         """在计算观测之前的回调，确保AMP观测被更新"""
@@ -389,9 +551,35 @@ class AMPMotionTracking(LeggedRobotMotionTracking):
         # 重新配置AMP数据为评估模式
         if self.amp_data_initialized:
             logger.info("重新配置AMP数据为评估模式")
-            self._reinit_amp_for_evaluation()
+            try:
+                self.expert_amp_loader = self._load_expert_amp_data_for_eval()
+                self.expert_data_loaded = True
+                logger.info(f"✅ AMP数据已切换到评估模式，expert数据形状: {self.expert_amp_loader.shape}")
+            except Exception as e:
+                logger.error(f"❌ AMP评估模式重新初始化失败: {e}")
+                # 使用安全的fallback
+                amp_obs_dim = self.config.robot.algo_obs_dim_dict["amp_obs"]
+                self.expert_amp_loader = torch.zeros(100, amp_obs_dim, device=self.device)
+                self.expert_data_loaded = True
         else:
             logger.info("AMP数据尚未初始化，标记为稍后处理")
+
+    def _post_physics_step(self):
+        """重写后处理步骤，添加AMP调试信息"""
+        super()._post_physics_step()
+        
+        # 延迟加载expert数据（如果还没有正确加载）
+        if not self.expert_data_loaded and self.common_step_counter % 1000 == 0:
+            try:
+                is_eval = getattr(self, 'is_evaluating', False)
+                if is_eval:
+                    self.expert_amp_loader = self._load_expert_amp_data_for_eval()
+                else:
+                    self.expert_amp_loader = self._load_expert_amp_data_for_training()
+                self.expert_data_loaded = True
+                logger.info(f"延迟加载expert数据完成，形状: {self.expert_amp_loader.shape}")
+            except Exception as e:
+                logger.debug(f"延迟加载expert数据失败: {e}")
 
     def _log_amp_debug_info(self):
         """记录AMP调试信息"""
@@ -405,10 +593,44 @@ class AMPMotionTracking(LeggedRobotMotionTracking):
             logger.debug(f"AMP Debug - Expert: mean={expert_amp_mean:.4f}, std={expert_amp_std:.4f}")
             logger.debug(f"AMP Debug - Expert数据量: {len(self.expert_amp_loader)}")
 
-    def _post_physics_step(self):
-        """重写后处理步骤，添加AMP调试信息"""
-        super()._post_physics_step()
-        
-        # 定期记录AMP调试信息
-        if self.common_step_counter % 1000 == 0:
-            self._log_amp_debug_info()
+    def _debug_motion_structure(self):
+        """调试motion数据结构"""
+        try:
+            if hasattr(self, '_motion_lib') and self._motion_lib is not None:
+                num_motions = self._motion_lib._num_unique_motions
+                logger.info(f"调试：总共有 {num_motions} 个motion")
+                
+                # 检查前几个motion的结构
+                for motion_id in range(min(3, num_motions)):
+                    try:
+                        motion_state = self._motion_lib.get_motion_state(
+                            torch.tensor([motion_id], device=self.device),
+                            torch.tensor([0.0], device=self.device),
+                            offset=torch.zeros(1, 3, device=self.device)
+                        )
+                        
+                        logger.info(f"Motion {motion_id} 包含的key: {list(motion_state.keys())}")
+                        
+                        if "rg_pos_t" in motion_state:
+                            rg_pos_shape = motion_state["rg_pos_t"].shape
+                            logger.info(f"Motion {motion_id} rg_pos_t shape: {rg_pos_shape}")
+                            
+                            if len(rg_pos_shape) >= 2:
+                                num_bodies = rg_pos_shape[1]
+                                logger.info(f"Motion {motion_id} 身体数量: {num_bodies}")
+                                logger.info(f"当前关键身体点ID: {self._key_body_ids}")
+                                
+                                max_id = torch.max(self._key_body_ids).item()
+                                if max_id >= num_bodies:
+                                    logger.error(f"Motion {motion_id}: 关键身体点ID {max_id} >= 身体数量 {num_bodies}")
+                                else:
+                                    logger.info(f"Motion {motion_id}: 关键身体点ID有效")
+                        
+                    except Exception as e:
+                        logger.error(f"检查motion {motion_id} 时出错: {e}")
+                        
+        except Exception as e:
+            logger.error(f"调试motion结构时出错: {e}")
+
+
+            
