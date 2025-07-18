@@ -367,6 +367,22 @@ class AMPMotionTracking(LeggedRobotMotionTracking):
         except Exception as e:
             logger.error(f"构建AMP观测时出错: {e}")
             return None
+    def _reset_tasks_callback(self, env_ids):
+        if len(env_ids) == 0:
+            return
+        super()._reset_tasks_callback(env_ids)
+        self._resample_motion_times(env_ids) # need to resample before reset root states
+        if self.config.termination.terminate_when_motion_far and self.config.termination_curriculum.terminate_when_motion_far_curriculum:
+            self._update_terminate_when_motion_far_curriculum()
+    def _update_terminate_when_motion_far_curriculum(self):
+        assert self.config.termination.terminate_when_motion_far and self.config.termination_curriculum.terminate_when_motion_far_curriculum
+        if self.average_episode_length < self.config.termination_curriculum.terminate_when_motion_far_curriculum_level_down_threshold:
+            self.terminate_when_motion_far_threshold *= (1 + self.config.termination_curriculum.terminate_when_motion_far_curriculum_degree)
+        elif self.average_episode_length > self.config.termination_curriculum.terminate_when_motion_far_curriculum_level_up_threshold:
+            self.terminate_when_motion_far_threshold *= (1 - self.config.termination_curriculum.terminate_when_motion_far_curriculum_degree)
+        self.terminate_when_motion_far_threshold = np.clip(self.terminate_when_motion_far_threshold, 
+                                                         self.config.termination_curriculum.terminate_when_motion_far_threshold_min, 
+                                                         self.config.termination_curriculum.terminate_when_motion_far_threshold_max)
 
     def _build_standard_amp_obs(self, root_pos, root_rot, root_vel, root_ang_vel, 
                                dof_pos, dof_vel, key_body_pos):
@@ -498,7 +514,16 @@ class AMPMotionTracking(LeggedRobotMotionTracking):
             if expert_data_size == 0:
                 logger.error("Expert数据为空！")
                 amp_obs_dim = self.config.robot.algo_obs_dim_dict["amp_obs"]
-                return torch.zeros(num_samples, amp_obs_dim, device=self.device)
+                fallback_data = torch.zeros(num_samples, amp_obs_dim, device=self.device)
+                logger.error("返回零数据作为fallback")
+                return fallback_data
+            
+            # 检查数据质量
+            if torch.isnan(self.expert_amp_loader).any() or torch.isinf(self.expert_amp_loader).any():
+                logger.error("Expert数据包含NaN或Inf！")
+                amp_obs_dim = self.config.robot.algo_obs_dim_dict["amp_obs"]
+                fallback_data = torch.zeros(num_samples, amp_obs_dim, device=self.device)
+                return fallback_data
             
             if expert_data_size < num_samples:
                 logger.debug(f"Expert数据不足: {expert_data_size} < {num_samples}，使用重复采样")
@@ -506,14 +531,28 @@ class AMPMotionTracking(LeggedRobotMotionTracking):
                 repeats = (num_samples // expert_data_size) + 1
                 expanded_data = self.expert_amp_loader.repeat(repeats, 1)
                 indices = torch.randperm(len(expanded_data))[:num_samples]
-                return expanded_data[indices]
+                sampled_data = expanded_data[indices]
             else:
                 # 随机采样
                 indices = torch.randperm(expert_data_size)[:num_samples]
-                return self.expert_amp_loader[indices]
-                
+                sampled_data = self.expert_amp_loader[indices]
+            
+            # 验证采样数据
+            if torch.isnan(sampled_data).any() or torch.isinf(sampled_data).any():
+                logger.error("采样的expert数据包含NaN或Inf！")
+                amp_obs_dim = self.config.robot.algo_obs_dim_dict["amp_obs"]
+                return torch.zeros(num_samples, amp_obs_dim, device=self.device)
+            
+            logger.debug(f"成功获取expert观测: shape={sampled_data.shape}, "
+                        f"mean={sampled_data.mean().item():.4f}, "
+                        f"std={sampled_data.std().item():.4f}")
+            
+            return sampled_data
+            
         except Exception as e:
             logger.error(f"获取expert观测时出错: {e}")
+            import traceback
+            traceback.print_exc()
             amp_obs_dim = self.config.robot.algo_obs_dim_dict["amp_obs"]
             return torch.zeros(num_samples, amp_obs_dim, device=self.device)
 
@@ -536,7 +575,8 @@ class AMPMotionTracking(LeggedRobotMotionTracking):
     def _init_buffers(self):
         """初始化缓冲区"""
         super()._init_buffers()
-        
+        self.terminate_when_motion_far_threshold = self.config.termination_curriculum.terminate_when_motion_far_initial_threshold
+
         # 验证AMP观测维度
         expected_amp_dim = self.config.robot.algo_obs_dim_dict["amp_obs"]
         logger.info(f"AMP观测维度: {expected_amp_dim}")
