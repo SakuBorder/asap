@@ -2,27 +2,94 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import time
+import numpy as np
 from humanoidverse.agents.ppo.ppo import PPO
 from humanoidverse.agents.modules.amp_modules import AMPDiscriminator
 from loguru import logger
+
+class AMPReplayBuffer:
+    """高效的AMP专家数据缓存"""
+    
+    def __init__(self, buffer_size, obs_dim, device):
+        self.buffer_size = buffer_size
+        self.device = device
+        self.obs_dim = obs_dim
+        
+        # 预分配内存
+        self._buffer = torch.zeros(buffer_size, obs_dim, device=device)
+        self._buffer_head = 0
+        self._buffer_size = 0
+        
+        # 预生成随机索引避免每次采样时重新生成
+        self._sample_indices = torch.randperm(buffer_size, device=device)
+        self._sample_head = 0
+        
+    def store(self, data):
+        """存储数据到buffer"""
+        batch_size = data.shape[0]
+        
+        if self._buffer_head + batch_size <= self.buffer_size:
+            self._buffer[self._buffer_head:self._buffer_head + batch_size] = data
+        else:
+            # 环形缓冲区
+            first_part = self.buffer_size - self._buffer_head
+            self._buffer[self._buffer_head:] = data[:first_part]
+            self._buffer[:batch_size - first_part] = data[first_part:]
+            
+        self._buffer_head = (self._buffer_head + batch_size) % self.buffer_size
+        self._buffer_size = min(self._buffer_size + batch_size, self.buffer_size)
+    
+    def sample(self, batch_size):
+        """高效采样"""
+        if self._buffer_size < batch_size:
+            logger.warning(f"Buffer size {self._buffer_size} < requested batch size {batch_size}")
+            batch_size = self._buffer_size
+            
+        # 使用预生成的随机索引
+        if self._sample_head + batch_size > self.buffer_size:
+            # 重新混洗索引
+            self._sample_indices = torch.randperm(self.buffer_size, device=self.device)
+            self._sample_head = 0
+            
+        indices = self._sample_indices[self._sample_head:self._sample_head + batch_size]
+        self._sample_head += batch_size
+        
+        # 只从有效数据中采样
+        valid_indices = indices % self._buffer_size
+        return self._buffer[valid_indices]
+    
+    def get_buffer_size(self):
+        return self._buffer_size
+    
+    def is_full(self):
+        return self._buffer_size >= self.buffer_size
 
 class AMPPPO(PPO):
     def __init__(self, env, config, log_dir=None, device='cpu'):
         # 在调用父类init前确保AMP配置正确
         self._pre_init_amp_config(env, config)
         super().__init__(env, config, log_dir, device)
+        
+        # AMP专家数据缓存
+        self._init_amp_demo_buffer()
+        
+        # ε-贪婪策略参数
+        self._enable_eps_greedy = config.get('enable_eps_greedy', True)
+        self._eps_greedy_prob = config.get('eps_greedy_prob', 0.1)
+        
+        # 混合精度训练
+        self.mixed_precision = config.get('mixed_precision', False)
+        if self.mixed_precision:
+            self.scaler = torch.cuda.amp.GradScaler()
 
     def _pre_init_amp_config(self, env, config):
         """在初始化前确保AMP配置正确"""
-        # 确保algo_obs_dim_dict存在
         if not hasattr(env.config.robot, 'algo_obs_dim_dict'):
             env.config.robot.algo_obs_dim_dict = {}
         
-        # 如果环境已经设置了AMP观测维度，使用环境的设置
         if "amp_obs" in env.config.robot.algo_obs_dim_dict:
             amp_obs_dim = env.config.robot.algo_obs_dim_dict["amp_obs"]
         else:
-            # 否则计算默认的AMP观测维度
             dof_obs_size = env.config.robot.dof_obs_size
             num_key_bodies = len(env.config.robot.key_bodies) if hasattr(env.config.robot, 'key_bodies') else 2
             amp_obs_dim = 1 + 6 + 3 + 3 + dof_obs_size + dof_obs_size + (3 * num_key_bodies)
@@ -33,7 +100,6 @@ class AMPPPO(PPO):
     def _setup_models_and_optimizer(self):
         super()._setup_models_and_optimizer()
         
-        # 再次确认AMP观测维度
         self._ensure_amp_obs_dim()
         
         # 创建AMP判别器
@@ -61,24 +127,108 @@ class AMPPPO(PPO):
             amp_obs_dim = self.algo_obs_dim_dict["amp_obs"]
             logger.info(f"确认amp_obs维度: {amp_obs_dim}")
 
+    def _init_amp_demo_buffer(self):
+        """初始化AMP专家数据缓存"""
+        amp_obs_dim = self.algo_obs_dim_dict["amp_obs"]
+        buffer_size = self.config.get('amp_demo_buffer_size', 50000)
+        
+        self.amp_demo_buffer = AMPReplayBuffer(buffer_size, amp_obs_dim, self.device)
+        
+        # 预填充demo buffer
+        self._prefill_amp_demo_buffer()
+        
+        # AMP数据预处理参数
+        self._normalize_amp_input = self.config.get('normalize_amp_input', True)
+        if self._normalize_amp_input:
+            self._init_amp_normalization()
+        
+        logger.info(f"AMP demo buffer初始化完成，大小: {buffer_size}")
+
+    def _prefill_amp_demo_buffer(self):
+        """预填充AMP demo buffer"""
+        try:
+            target_size = self.amp_demo_buffer.buffer_size
+            batch_size = min(1000, target_size // 10)  # 每次填充1000个样本
+            
+            filled_count = 0
+            max_attempts = target_size // batch_size + 10
+            
+            for attempt in range(max_attempts):
+                if filled_count >= target_size:
+                    break
+                    
+                try:
+                    # 获取expert数据
+                    curr_samples = self._fetch_amp_obs_demo(batch_size)
+                    if curr_samples is not None and curr_samples.shape[0] > 0:
+                        self.amp_demo_buffer.store(curr_samples)
+                        filled_count += curr_samples.shape[0]
+                        
+                        if attempt % 5 == 0:
+                            logger.info(f"已填充AMP buffer: {filled_count}/{target_size}")
+                    else:
+                        logger.warning(f"第{attempt}次获取expert数据失败")
+                        
+                except Exception as e:
+                    logger.warning(f"填充demo buffer时出错 (attempt {attempt}): {e}")
+                    continue
+            
+            final_size = self.amp_demo_buffer.get_buffer_size()
+            logger.info(f"AMP demo buffer预填充完成: {final_size}/{target_size}")
+            
+        except Exception as e:
+            logger.error(f"预填充AMP demo buffer失败: {e}")
+
+    def _fetch_amp_obs_demo(self, num_samples):
+        """获取专家AMP观测数据"""
+        try:
+            return self.env.get_expert_amp_observations(num_samples)
+        except Exception as e:
+            logger.error(f"获取expert观测失败: {e}")
+            return None
+
+    def _init_amp_normalization(self):
+        """初始化AMP观测归一化参数"""
+        try:
+            # 收集一批数据计算归一化参数
+            sample_size = min(1000, self.amp_demo_buffer.get_buffer_size())
+            if sample_size > 0:
+                samples = self.amp_demo_buffer.sample(sample_size)
+                self.amp_obs_mean = samples.mean(dim=0, keepdim=True)
+                self.amp_obs_std = samples.std(dim=0, keepdim=True) + 1e-8
+                logger.info("AMP观测归一化参数初始化完成")
+            else:
+                # 使用默认值
+                amp_obs_dim = self.algo_obs_dim_dict["amp_obs"]
+                self.amp_obs_mean = torch.zeros(1, amp_obs_dim, device=self.device)
+                self.amp_obs_std = torch.ones(1, amp_obs_dim, device=self.device)
+                logger.warning("使用默认AMP归一化参数")
+                
+        except Exception as e:
+            logger.error(f"初始化AMP归一化失败: {e}")
+            amp_obs_dim = self.algo_obs_dim_dict["amp_obs"]
+            self.amp_obs_mean = torch.zeros(1, amp_obs_dim, device=self.device)
+            self.amp_obs_std = torch.ones(1, amp_obs_dim, device=self.device)
+
+    def _preproc_amp_obs(self, amp_obs):
+        """预处理AMP观测（归一化）"""
+        if self._normalize_amp_input:
+            return (amp_obs - self.amp_obs_mean) / self.amp_obs_std
+        return amp_obs
+
     def _setup_storage(self):
         super()._setup_storage()
         
-        # 确保AMP观测维度存在
         self._ensure_amp_obs_dim()
         
-        # 注册AMP观测存储
         try:
-            # import ipdb;ipdb.set_trace()
             amp_obs_dim = self.algo_obs_dim_dict["amp_obs"]
-            # self.storage.register_key('amp_obs', shape=(amp_obs_dim,), dtype=torch.float)
             logger.info(f"✅ 成功注册AMP观测存储，维度: {amp_obs_dim}")
             logger.info(f"当前已注册的keys: {self.storage.stored_keys}")
             self.amp_storage_available = True
         except Exception as e:
             logger.error(f"❌ AMP观测存储注册失败: {e}")
             self.amp_storage_available = False
-            # 不再有fallback重试，直接标记为不可用
             logger.warning("⚠️  AMP将在无存储模式下运行")
 
     def _init_loss_dict_at_training_step(self):
@@ -107,11 +257,26 @@ class AMPPPO(PPO):
         loss_dict['Current_Data_Mean'] = 0.0
         loss_dict['Current_Data_Std'] = 0.0
         
+        # Demo buffer状态
+        loss_dict['Demo_Buffer_Size'] = float(self.amp_demo_buffer.get_buffer_size())
+        loss_dict['Demo_Buffer_Full'] = float(self.amp_demo_buffer.is_full())
+        
         return loss_dict
 
+    def _apply_eps_greedy_action(self, actions, amp_obs):
+        """应用ε-贪婪策略"""
+        if not self._enable_eps_greedy:
+            return actions
+            
+        if torch.rand(1).item() < self._eps_greedy_prob:
+            # 随机动作
+            random_actions = torch.randn_like(actions)
+            return random_actions
+        
+        return actions
 
     def _rollout_step(self, obs_dict):
-        """重写rollout以包含AMP观测"""
+        """重写rollout以包含AMP观测和ε-贪婪策略"""
         with torch.inference_mode():
             for i in range(self.num_steps_per_env):
                 policy_state_dict = {}
@@ -122,11 +287,13 @@ class AMPPPO(PPO):
                 # 获取AMP观测
                 amp_obs = self._get_amp_observations()
                 
-                # 验证AMP观测
                 if amp_obs is None:
                     logger.error("AMP observations is None during rollout")
                     amp_obs = torch.zeros(self.env.num_envs, self.algo_obs_dim_dict["amp_obs"], device=self.device)
                 
+                # 应用ε-贪婪策略
+                actions = self._apply_eps_greedy_action(policy_state_dict["actions"], amp_obs)
+                policy_state_dict["actions"] = actions
                 policy_state_dict["amp_obs"] = amp_obs
 
                 # 存储观测到storage
@@ -152,9 +319,7 @@ class AMPPPO(PPO):
                 # 计算AMP奖励
                 amp_rewards, amp_reward_computed = self._compute_amp_rewards(amp_obs)
                 
-                # 验证AMP奖励计算
                 if amp_reward_computed:
-                    # 检查奖励是否有效
                     if torch.isnan(amp_rewards).any() or torch.isinf(amp_rewards).any():
                         logger.error("AMP rewards contain NaN or Inf, skipping")
                         amp_reward_computed = False
@@ -188,32 +353,18 @@ class AMPPPO(PPO):
                     self.cur_reward_sum += rewards
                     self.cur_episode_length += 1
                     new_ids = (dones > 0).nonzero(as_tuple=False).flatten()
-                    # self.rewbuffer.extend(self.cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                    
                     if len(new_ids) > 0:
                         if len(self.cur_reward_sum.shape) == 1:
-                            # 如果是1D tensor，直接使用
                             reward_values = self.cur_reward_sum[new_ids].cpu().numpy().tolist()
                             length_values = self.cur_episode_length[new_ids].cpu().numpy().tolist()
                         else:
-                            # 如果是2D tensor，取第一列
                             reward_values = self.cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist()
                             length_values = self.cur_episode_length[new_ids][:, 0].cpu().numpy().tolist()
                         
                         self.rewbuffer.extend(reward_values)
                         self.lenbuffer.extend(length_values)
-                    # self.lenbuffer.extend(self.cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
-                    if len(new_ids) > 0:
-                        if len(self.cur_reward_sum.shape) == 1:
-                            # 如果是1D tensor，直接使用
-                            reward_values = self.cur_reward_sum[new_ids].cpu().numpy().tolist()
-                            length_values = self.cur_episode_length[new_ids].cpu().numpy().tolist()
-                        else:
-                            # 如果是2D tensor，取第一列
-                            reward_values = self.cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist()
-                            length_values = self.cur_episode_length[new_ids][:, 0].cpu().numpy().tolist()
                         
-                        self.rewbuffer.extend(reward_values)
-                        self.lenbuffer.extend(length_values)
                     self.cur_reward_sum[new_ids] = 0
                     self.cur_episode_length[new_ids] = 0
 
@@ -237,7 +388,6 @@ class AMPPPO(PPO):
     def _get_amp_observations(self):
         """获取AMP观测的统一接口"""
         try:
-            # 尝试多种方法获取AMP观测
             if hasattr(self.env, '_compute_amp_observations'):
                 amp_obs = self.env._compute_amp_observations()
                 logger.debug(f"从环境_compute_amp_observations获取AMP观测，形状: {amp_obs.shape}")
@@ -247,12 +397,10 @@ class AMPPPO(PPO):
                 logger.debug(f"从环境_get_obs_amp_obs获取AMP观测，形状: {amp_obs.shape}")
                 return amp_obs
             elif 'amp_obs' in self.env.obs_buf_dict_raw.get('critic_obs', {}):
-                # 尝试从obs_buf_dict_raw获取
                 amp_obs = self.env.obs_buf_dict_raw['critic_obs']['amp_obs']
                 logger.debug(f"从obs_buf_dict_raw获取AMP观测，形状: {amp_obs.shape}")
                 return amp_obs
             else:
-                # Fallback: 手动构造AMP观测
                 logger.debug("使用fallback方法构造AMP观测")
                 return self._construct_amp_observations_fallback()
                 
@@ -274,14 +422,12 @@ class AMPPPO(PPO):
             
         except Exception as e:
             logger.error(f"Fallback构造AMP观测失败: {e}")
-            # 最后的fallback：返回零观测
             amp_obs_dim = self.algo_obs_dim_dict["amp_obs"]
             return torch.zeros(self.env.num_envs, amp_obs_dim, device=self.device)
 
     def _compute_amp_rewards(self, amp_obs):
         """计算AMP奖励"""
         try:
-            # 验证输入数据
             if amp_obs is None:
                 logger.error("AMP observations is None")
                 return torch.zeros(self.env.num_envs, device=self.device), False
@@ -290,15 +436,16 @@ class AMPPPO(PPO):
                 logger.error("AMP observations is empty")
                 return torch.zeros(self.env.num_envs, device=self.device), False
                 
-            # 检查数据质量
             if torch.isnan(amp_obs).any() or torch.isinf(amp_obs).any():
                 logger.error("AMP observations contains NaN or Inf")
                 return torch.zeros(amp_obs.shape[0], device=self.device), False
                 
-            # 计算discriminator奖励
-            amp_rewards = self.discriminator.compute_disc_rewards(amp_obs)
+            # 预处理AMP观测
+            processed_amp_obs = self._preproc_amp_obs(amp_obs)
             
-            # 验证奖励
+            # 计算discriminator奖励
+            amp_rewards = self.discriminator.compute_disc_rewards(processed_amp_obs)
+            
             if torch.isnan(amp_rewards).any() or torch.isinf(amp_rewards).any():
                 logger.error("AMP rewards contains NaN or Inf")
                 return torch.zeros(amp_obs.shape[0], device=self.device), False
@@ -325,21 +472,16 @@ class AMPPPO(PPO):
             infos["to_log"] = {}
         
         if amp_reward_computed and amp_rewards is not None:
-            # 记录实际的AMP奖励统计
             infos["to_log"]["amp_reward_mean"] = torch.tensor(amp_rewards.mean().item(), device=self.device, dtype=torch.float)
             infos["to_log"]["amp_reward_std"] = torch.tensor(amp_rewards.std().item(), device=self.device, dtype=torch.float)
             infos["to_log"]["amp_reward_min"] = torch.tensor(amp_rewards.min().item(), device=self.device, dtype=torch.float)
             infos["to_log"]["amp_reward_max"] = torch.tensor(amp_rewards.max().item(), device=self.device, dtype=torch.float)
             infos["to_log"]["amp_reward_active"] = torch.tensor(1.0, device=self.device, dtype=torch.float)
             
-            # 记录加权后的AMP奖励（实际使用的）
             weighted_amp_rewards = amp_rewards * self.config.amp_reward_weight
             infos["to_log"]["weighted_amp_reward_mean"] = torch.tensor(weighted_amp_rewards.mean().item(), device=self.device, dtype=torch.float)
-            
-            # 记录AMP奖励权重
             infos["to_log"]["amp_reward_weight"] = torch.tensor(self.config.amp_reward_weight, device=self.device, dtype=torch.float)
         else:
-            # 标记AMP奖励未计算
             infos["to_log"]["amp_reward_mean"] = torch.tensor(0.0, device=self.device, dtype=torch.float)
             infos["to_log"]["amp_reward_std"] = torch.tensor(0.0, device=self.device, dtype=torch.float)
             infos["to_log"]["amp_reward_min"] = torch.tensor(0.0, device=self.device, dtype=torch.float)
@@ -348,12 +490,10 @@ class AMPPPO(PPO):
             infos["to_log"]["weighted_amp_reward_mean"] = torch.tensor(0.0, device=self.device, dtype=torch.float)
             infos["to_log"]["amp_reward_weight"] = torch.tensor(self.config.amp_reward_weight, device=self.device, dtype=torch.float)
             
-            # 记录问题原因
             if amp_rewards is None:
                 logger.warning("AMP rewards is None - discriminator computation failed")
             if not amp_reward_computed:
                 logger.warning("AMP reward computation failed")
-
 
     def _ensure_infos_tensors(self, infos):
         """确保infos["to_log"]中的所有值都是tensor"""
@@ -366,11 +506,37 @@ class AMPPPO(PPO):
                     if len(infos["to_log"][key].shape) > 0:
                         infos["to_log"][key] = infos["to_log"][key].mean()
 
+    def _update_amp_demos(self):
+        """每个epoch更新demo数据"""
+        try:
+            # 添加新的expert数据到buffer
+            new_samples = self._fetch_amp_obs_demo(self.config.get('amp_demo_refresh_size', 256))
+            if new_samples is not None and new_samples.shape[0] > 0:
+                self.amp_demo_buffer.store(new_samples)
+                
+        except Exception as e:
+            logger.warning(f"更新AMP demos时出错: {e}")
+
     def _update_algo_step(self, policy_state_dict, loss_dict):
+        """更新算法步骤，包含判别器更新"""
+        # 每个epoch都更新demo数据
+        self._update_amp_demos()
+        
+        # 使用混合精度训练
+        if self.mixed_precision:
+            with torch.cuda.amp.autocast():
+                loss_dict = self._update_algo_step_amp(policy_state_dict, loss_dict)
+        else:
+            loss_dict = self._update_algo_step_amp(policy_state_dict, loss_dict)
+            
+        return loss_dict
+
+    def _update_algo_step_amp(self, policy_state_dict, loss_dict):
+        """AMP特定的算法更新步骤"""
         # 先更新基础PPO
         loss_dict = super()._update_algo_step(policy_state_dict, loss_dict)
         
-        # 然后更新判别器
+        # 然后更新判别器（每步都更新）
         if self.amp_storage_available and "amp_obs" in policy_state_dict:
             loss_dict = self._update_discriminator(policy_state_dict, loss_dict)
         else:
@@ -390,19 +556,30 @@ class AMPPPO(PPO):
             fake_amp_obs = policy_state_dict["amp_obs"]
             batch_size = fake_amp_obs.shape[0]
             
-            # 获取真实数据（专家演示）
-            real_amp_obs = self._get_expert_amp_observations(batch_size)
+            # 从demo buffer获取真实数据
+            real_amp_obs = self.amp_demo_buffer.sample(batch_size)
+            
+            # 预处理观测
+            fake_amp_obs = self._preproc_amp_obs(fake_amp_obs)
+            real_amp_obs = self._preproc_amp_obs(real_amp_obs)
             
             # 计算判别器损失
             disc_loss, disc_info = self.discriminator.compute_disc_loss(real_amp_obs, fake_amp_obs)
             
             # 更新判别器
-            self.discriminator_optimizer.zero_grad()
-            disc_loss.backward()
-            nn.utils.clip_grad_norm_(self.discriminator.parameters(), self.max_grad_norm)
-            self.discriminator_optimizer.step()
+            if self.mixed_precision:
+                self.scaler.scale(disc_loss).backward()
+                self.scaler.unscale_(self.discriminator_optimizer)
+                nn.utils.clip_grad_norm_(self.discriminator.parameters(), self.max_grad_norm)
+                self.scaler.step(self.discriminator_optimizer)
+                self.scaler.update()
+            else:
+                self.discriminator_optimizer.zero_grad()
+                disc_loss.backward()
+                nn.utils.clip_grad_norm_(self.discriminator.parameters(), self.max_grad_norm)
+                self.discriminator_optimizer.step()
             
-            # 记录判别器信息到loss_dict（这些会被展示）
+            # 记录判别器信息到loss_dict
             loss_dict['Discriminator_Loss'] += disc_info['disc_loss']
             loss_dict['Discriminator_Real_Acc'] += disc_info['real_acc']
             loss_dict['Discriminator_Fake_Acc'] += disc_info['fake_acc']
@@ -454,14 +631,18 @@ class AMPPPO(PPO):
         
         return loss_dict
 
-
     def _get_expert_amp_observations(self, batch_size):
-        """获取专家AMP观测"""
+        """获取专家AMP观测（优化版本）"""
         try:
+            # 直接从高效的demo buffer采样
+            return self.amp_demo_buffer.sample(batch_size)
+            
+        except Exception as e:
+            logger.error(f"从demo buffer获取expert观测失败: {e}")
+            # Fallback到原始方法
             if hasattr(self.env, 'get_expert_amp_observations'):
                 expert_obs = self.env.get_expert_amp_observations(num_samples=batch_size)
                 
-                # 验证expert数据
                 if expert_obs is None:
                     logger.error("Expert AMP observations is None")
                     raise ValueError("Expert data is None")
@@ -481,20 +662,13 @@ class AMPPPO(PPO):
                 return expert_obs
             else:
                 logger.warning("环境没有get_expert_amp_observations方法")
-                # Fallback: 使用随机数据（这不理想，但至少不会崩溃）
                 amp_obs_dim = self.algo_obs_dim_dict["amp_obs"]
                 fallback_data = torch.randn(batch_size, amp_obs_dim, device=self.device)
                 logger.warning(f"使用随机fallback数据: shape={fallback_data.shape}")
                 return fallback_data
-                
-        except Exception as e:
-            logger.error(f"获取专家AMP观测失败: {e}")
-            amp_obs_dim = self.algo_obs_dim_dict["amp_obs"]
-            fallback_data = torch.randn(batch_size, amp_obs_dim, device=self.device)
-            logger.error(f"使用随机fallback数据: shape={fallback_data.shape}")
-            return fallback_data
 
     def load(self, ckpt_path):
+        """加载checkpoint，包含判别器状态"""
         if ckpt_path is not None:
             loaded_dict = torch.load(ckpt_path, map_location=self.device)
             self.actor.load_state_dict(loaded_dict["actor_model_state_dict"])
@@ -522,11 +696,18 @@ class AMPPPO(PPO):
                 
                 self.set_learning_rate(self.actor_learning_rate, self.critic_learning_rate, self.discriminator_learning_rate)
                 
+            # 加载AMP归一化参数（如果存在）
+            if "amp_obs_mean" in loaded_dict and "amp_obs_std" in loaded_dict:
+                self.amp_obs_mean = loaded_dict["amp_obs_mean"]
+                self.amp_obs_std = loaded_dict["amp_obs_std"]
+                logger.info("加载AMP归一化参数")
+                
             self.current_learning_iteration = loaded_dict["iter"]
             return loaded_dict["infos"]
 
     def save(self, path, infos=None):
-        torch.save({
+        """保存checkpoint，包含判别器状态"""
+        save_dict = {
             'actor_model_state_dict': self.actor.state_dict(),
             'critic_model_state_dict': self.critic.state_dict(),
             'discriminator_model_state_dict': self.discriminator.state_dict(),
@@ -535,9 +716,17 @@ class AMPPPO(PPO):
             'discriminator_optimizer_state_dict': self.discriminator_optimizer.state_dict(),
             'iter': self.current_learning_iteration,
             'infos': infos,
-        }, path)
+        }
+        
+        # 保存AMP归一化参数
+        if hasattr(self, 'amp_obs_mean') and hasattr(self, 'amp_obs_std'):
+            save_dict['amp_obs_mean'] = self.amp_obs_mean
+            save_dict['amp_obs_std'] = self.amp_obs_std
+            
+        torch.save(save_dict, path)
 
     def set_learning_rate(self, actor_learning_rate, critic_learning_rate, discriminator_learning_rate=None):
+        """设置学习率，包含判别器"""
         super().set_learning_rate(actor_learning_rate, critic_learning_rate)
         if discriminator_learning_rate is not None:
             self.discriminator_learning_rate = discriminator_learning_rate
@@ -546,6 +735,7 @@ class AMPPPO(PPO):
 
     @property
     def inference_model(self):
+        """推理模型，包含判别器"""
         return {
             "actor": self.actor,
             "critic": self.critic,
