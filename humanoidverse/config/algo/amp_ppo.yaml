@@ -22,12 +22,34 @@ algo:
     # AMP特定参数
     discriminator_learning_rate: 5.e-4
     amp_reward_weight: 0.5
-    discriminator_update_freq: 1
+    discriminator_update_freq: 1  # 每步都更新判别器
     generator_update_freq: 1
+    
+    # 自适应权重调整
     use_adaptive_weights: True
     min_amp_weight: 0.1
     max_amp_weight: 2.0
+    weight_decay: 0.99
+    weight_increase: 1.01
+    acc_history_length: 100
 
+    # Demo buffer配置
+    amp_demo_buffer_size: 50000  # 增大buffer提高数据多样性
+    amp_demo_refresh_size: 256   # 每epoch刷新的数据量
+    
+    # AMP数据预处理
+    normalize_amp_input: True
+    
+    # ε-贪婪策略
+    enable_eps_greedy: True
+    eps_greedy_prob: 0.1
+    eps_start: 1.0
+    eps_end: 0.1
+    eps_decay: 0.995
+    
+    # 混合精度训练
+    mixed_precision: True
+    
     # 训练参数
     num_steps_per_env: 24
     save_interval: 100
@@ -59,7 +81,12 @@ algo:
         output_dim: [1]
         layer_config:
           type: MLP
-          hidden_dims: [1024, 512, 256, 128]
+          hidden_dims: [1024, 512, 256, 128]  # 更深的网络提高判别能力
           activation: ELU
+        # 梯度惩罚和正则化
         gradient_penalty_weight: 10.0
         use_spectral_norm: False
+        use_wgan: False  # 使用标准GAN损失
+        disc_logit_reg: 0.0001  # logit权重正则化
+        disc_grad_penalty: 5.0  # 梯度惩罚权重
+        logit_reg_weight: 0.0001
