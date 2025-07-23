@@ -40,67 +40,6 @@ def quat_to_tan_norm(q):
     
     return torch.cat([col1, col2], dim=-1)
 
-class AMPExpertDataCache:
-    """AMP专家数据预加载和缓存系统"""
-    
-    def __init__(self, device, cache_size=10000):
-        self.device = device
-        self.cache_size = cache_size
-        self.data_cache = None
-        self.cache_filled = False
-        self.cache_index = 0
-        
-    def initialize_cache(self, amp_obs_dim):
-        """初始化缓存"""
-        self.data_cache = torch.zeros(self.cache_size, amp_obs_dim, device=self.device)
-        logger.info(f"初始化AMP数据缓存: {self.cache_size} x {amp_obs_dim}")
-    
-    def add_data(self, data):
-        """添加数据到缓存"""
-        if self.data_cache is None:
-            return False
-            
-        batch_size = data.shape[0]
-        if self.cache_index + batch_size <= self.cache_size:
-            self.data_cache[self.cache_index:self.cache_index + batch_size] = data
-            self.cache_index += batch_size
-        else:
-            # 环形缓冲
-            remaining = self.cache_size - self.cache_index
-            self.data_cache[self.cache_index:] = data[:remaining]
-            self.data_cache[:batch_size - remaining] = data[remaining:]
-            self.cache_index = batch_size - remaining
-            self.cache_filled = True
-            
-        return True
-    
-    def sample(self, batch_size):
-        """从缓存中采样"""
-        if self.data_cache is None:
-            return None
-            
-        if not self.cache_filled and self.cache_index < batch_size:
-            # 缓存数据不足
-            return self.data_cache[:self.cache_index] if self.cache_index > 0 else None
-            
-        # 随机采样
-        if self.cache_filled:
-            indices = torch.randperm(self.cache_size, device=self.device)[:batch_size]
-        else:
-            indices = torch.randperm(self.cache_index, device=self.device)[:batch_size]
-            
-        return self.data_cache[indices]
-    
-    def get_cache_size(self):
-        """获取缓存中的数据量"""
-        if not self.cache_filled:
-            return self.cache_index
-        return self.cache_size
-    
-    def is_cache_ready(self):
-        """检查缓存是否准备好"""
-        return self.cache_filled or self.cache_index >= self.cache_size // 10  # 至少10%数据
-
 class AMPMotionTracking(LeggedRobotMotionTracking):
     def __init__(self, config, device):
         # 在调用父类初始化之前，先修复AMP观测维度配置
@@ -112,9 +51,6 @@ class AMPMotionTracking(LeggedRobotMotionTracking):
         
         # 设置关键身体点索引（用于AMP观测）
         self._setup_key_body_ids()
-        
-        # 初始化AMP数据缓存系统
-        self._init_amp_data_cache()
         
         # 检查评估模式状态
         logger.info(f"初始化完成后的评估模式状态: {getattr(self, 'is_evaluating', False)}")
@@ -154,7 +90,7 @@ class AMPMotionTracking(LeggedRobotMotionTracking):
             config.robot.algo_obs_dim_dict["amp_obs"] = 79  # 默认值
 
     def _setup_key_body_ids(self):
-        """设置关键身体点索引 - 使用安全的方法"""
+        """设置关键身体点索引 - 使用安全的方法（完全参考版本1）"""
         try:
             # 优先使用脚部索引
             if hasattr(self, 'feet_indices') and len(self.feet_indices) > 0:
@@ -170,23 +106,8 @@ class AMPMotionTracking(LeggedRobotMotionTracking):
             # 使用最安全的默认值
             self._key_body_ids = torch.tensor([6, 12], device=self.device)
 
-    def _init_amp_data_cache(self):
-        """初始化AMP数据缓存系统"""
-        try:
-            amp_obs_dim = self.config.robot.algo_obs_dim_dict["amp_obs"]
-            cache_size = getattr(self.config, 'amp_cache_size', 20000)
-            
-            # 创建专家数据缓存
-            self.expert_data_cache = AMPExpertDataCache(self.device, cache_size)
-            self.expert_data_cache.initialize_cache(amp_obs_dim)
-            
-            logger.info(f"AMP数据缓存系统初始化完成，缓存大小: {cache_size}")
-            
-        except Exception as e:
-            logger.error(f"AMP数据缓存初始化失败: {e}")
-
     def _init_amp_data(self):
-        """初始化AMP相关数据 - 使用缓存优化"""
+        """初始化AMP相关数据 - 完全参考版本1的方法"""
         try:
             # 获取AMP观测维度
             amp_obs_dim = self.config.robot.algo_obs_dim_dict["amp_obs"]
@@ -200,108 +121,98 @@ class AMPMotionTracking(LeggedRobotMotionTracking):
             
             logger.info(f"初始化AMP观测缓冲区，形状: {self.amp_obs_buf.shape}")
             
-            # 异步预加载expert数据
-            self._preload_expert_data_async()
+            # 版本1的方法：初始化时使用最小的expert数据集，不进行复杂的预加载
+            self.expert_amp_loader = torch.zeros(100, amp_obs_dim, device=self.device)
             
-            # 标记为已初始化
+            # 标记为已初始化，但expert数据稍后加载
             self.amp_data_initialized = True
+            self.expert_data_loaded = False
             
-            logger.info("AMP数据初始化完成")
+            logger.info("AMP数据初始化完成，expert数据将在稍后加载")
             
         except Exception as e:
             logger.error(f"AMP数据初始化失败: {e}")
             # 使用最小的fallback
             amp_obs_dim = 79
             self.amp_obs_buf = torch.zeros(self.num_envs, amp_obs_dim, device=self.device)
+            self.expert_amp_loader = torch.zeros(100, amp_obs_dim, device=self.device)
             self.amp_data_initialized = False
+            self.expert_data_loaded = False
 
-    def _preload_expert_data_async(self):
-        """异步预加载expert数据到缓存"""
+    def _safe_get_motion_state(self, motion_id, time):
+        """安全地获取motion状态 - 避免越界"""
         try:
-            is_eval = getattr(self, 'is_evaluating', False)
-            target_samples = 5000 if is_eval else 20000
-            batch_size = 500
+            # 确保motion_id在有效范围内
+            num_motions = self._motion_lib._num_unique_motions
+            if motion_id >= num_motions:
+                logger.warning(f"Motion ID {motion_id} 超出范围，使用0")
+                motion_id = 0
             
-            loaded_count = 0
-            max_attempts = target_samples // batch_size + 10
-            
-            for attempt in range(max_attempts):
-                if loaded_count >= target_samples:
-                    break
-                    
-                try:
-                    # 批量生成expert数据
-                    expert_batch = self._generate_expert_batch(batch_size)
-                    if expert_batch is not None and expert_batch.shape[0] > 0:
-                        success = self.expert_data_cache.add_data(expert_batch)
-                        if success:
-                            loaded_count += expert_batch.shape[0]
-                            
-                            if attempt % 10 == 0:
-                                logger.info(f"预加载expert数据进度: {loaded_count}/{target_samples}")
-                        else:
-                            logger.warning(f"缓存数据失败 (attempt {attempt})")
-                    else:
-                        logger.warning(f"生成expert数据失败 (attempt {attempt})")
-                        
-                except Exception as e:
-                    logger.warning(f"预加载expert数据时出错 (attempt {attempt}): {e}")
-                    continue
-            
-            final_cache_size = self.expert_data_cache.get_cache_size()
-            logger.info(f"Expert数据预加载完成: {final_cache_size}/{target_samples}")
+            motion_state = self._motion_lib.get_motion_state(
+                torch.tensor([motion_id], device=self.device),
+                torch.tensor([time], device=self.device),
+                offset=torch.zeros(1, 3, device=self.device)
+            )
+            return motion_state
             
         except Exception as e:
-            logger.error(f"预加载expert数据失败: {e}")
+            logger.error(f"获取motion状态失败 (motion_id={motion_id}): {e}")
+            return None
 
-    def _generate_expert_batch(self, batch_size):
-        """批量生成expert数据"""
+    def _load_expert_amp_data_simple(self):
+        """简单的expert数据加载 - 避免复杂验证（参考版本1）"""
+        expert_states = []
+        amp_obs_dim = self.config.robot.algo_obs_dim_dict["amp_obs"]
+        
         try:
-            if not hasattr(self, '_motion_lib') or self._motion_lib is None:
-                return None
-                
-            num_motions = self._motion_lib._num_unique_motions
-            if num_motions == 0:
-                return None
-                
-            expert_states = []
+            # 只使用motion 0，通过时间采样获得多样性
+            motion_id = 0
             
-            # 随机选择motion和时间点
-            motion_ids = torch.randint(0, num_motions, (batch_size,), device=self.device)
+            # 先测试能否获取motion长度
+            try:
+                motion_length = self._motion_lib.get_motion_length([motion_id]).item()
+                logger.info(f"Motion {motion_id} 长度: {motion_length}s")
+            except Exception as e:
+                logger.error(f"无法获取motion长度: {e}")
+                # 使用默认值
+                motion_length = 1.0
             
-            for i in range(batch_size):
+            # 采样时间点
+            num_samples = 100
+            for i in range(num_samples):
                 try:
-                    motion_id = motion_ids[i].item()
-                    motion_length = self._motion_lib.get_motion_length([motion_id]).item()
+                    # 均匀分布的时间点
+                    time_ratio = i / max(1, num_samples - 1)
+                    time = time_ratio * max(0.1, motion_length - 0.1)
                     
-                    # 随机采样时间点
-                    time = torch.rand(1, device=self.device) * max(0.1, motion_length - 0.1)
+                    # 安全地获取motion状态
+                    motion_state = self._safe_get_motion_state(motion_id, time)
+                    if motion_state is None:
+                        continue
                     
-                    motion_state = self._motion_lib.get_motion_state(
-                        torch.tensor([motion_id], device=self.device),
-                        time,
-                        offset=torch.zeros(1, 3, device=self.device)
-                    )
-                    
-                    amp_obs = self._build_amp_obs_from_state(motion_state)
+                    # 构建AMP观测
+                    amp_obs = self._build_amp_obs_from_state_simple(motion_state)
                     if amp_obs is not None:
                         expert_states.append(amp_obs)
                         
                 except Exception as e:
-                    logger.debug(f"生成单个expert样本失败: {e}")
+                    logger.debug(f"处理时间点 {i} 失败: {e}")
                     continue
             
             if len(expert_states) > 0:
-                return torch.stack(expert_states)
+                result = torch.stack(expert_states)
+                logger.info(f"成功加载 {len(expert_states)} 个expert观测")
+                return result
             else:
-                return None
+                logger.error("没有加载到任何expert数据，返回零数据")
+                return torch.zeros(100, amp_obs_dim, device=self.device)
                 
         except Exception as e:
-            logger.error(f"批量生成expert数据失败: {e}")
-            return None
+            logger.error(f"Expert数据加载失败: {e}")
+            return torch.zeros(100, amp_obs_dim, device=self.device)
 
-    def _build_amp_obs_from_state(self, motion_state):
-        """从motion状态构建标准AMP观测"""
+    def _build_amp_obs_from_state_simple(self, motion_state):
+        """从motion状态构建AMP观测 - 简化版本（参考版本1）"""
         try:
             # 检查必要的状态是否存在
             required_keys = ["root_pos", "root_rot", "root_vel", "root_ang_vel", "dof_pos", "dof_vel"]
@@ -317,37 +228,31 @@ class AMPMotionTracking(LeggedRobotMotionTracking):
             dof_pos = motion_state["dof_pos"][0]        # [30]
             dof_vel = motion_state["dof_vel"][0]        # [30]
             
-            # 安全地获取关键身体点
+            # 简化处理关键身体点：如果获取失败就用零向量
             if "rg_pos_t" in motion_state:
-                all_body_pos = motion_state["rg_pos_t"][0]  # [num_bodies, 3]
-                num_bodies = all_body_pos.shape[0]
-                
-                # 确保所有关键身体点索引都在有效范围内
-                valid_key_body_ids = []
-                for idx in self._key_body_ids:
-                    if idx < num_bodies:
-                        valid_key_body_ids.append(idx)
-                    else:
-                        logger.warning(f"关键身体点索引 {idx} 超出范围，跳过")
-                
-                if len(valid_key_body_ids) > 0:
-                    # 使用有效的索引
-                    valid_indices = torch.tensor(valid_key_body_ids, device=self.device)
-                    key_body_pos = all_body_pos[valid_indices]
+                try:
+                    all_body_pos = motion_state["rg_pos_t"][0]  # [num_bodies, 3]
+                    num_bodies = all_body_pos.shape[0]
                     
-                    # 如果有效索引数量不足，用零向量补充
-                    if len(valid_key_body_ids) < len(self._key_body_ids):
-                        missing_count = len(self._key_body_ids) - len(valid_key_body_ids)
-                        zeros = torch.zeros(missing_count, 3, device=self.device)
-                        key_body_pos = torch.cat([key_body_pos, zeros], dim=0)
-                else:
-                    # 如果没有有效索引，使用零向量
+                    # 简单处理：确保索引不越界
+                    safe_indices = []
+                    for idx in self._key_body_ids:
+                        if isinstance(idx, torch.Tensor):
+                            idx = idx.item()
+                        safe_idx = min(idx, num_bodies - 1)
+                        safe_indices.append(safe_idx)
+                    
+                    if len(safe_indices) > 0:
+                        indices_tensor = torch.tensor(safe_indices, device=self.device)
+                        key_body_pos = all_body_pos[indices_tensor]
+                    else:
+                        key_body_pos = torch.zeros(len(self._key_body_ids), 3, device=self.device)
+                        
+                except Exception as e:
+                    logger.debug(f"处理关键身体点失败: {e}")
                     key_body_pos = torch.zeros(len(self._key_body_ids), 3, device=self.device)
-                    logger.warning("没有有效的关键身体点索引，使用零向量")
             else:
-                # 如果没有rg_pos_t数据，使用零向量
                 key_body_pos = torch.zeros(len(self._key_body_ids), 3, device=self.device)
-                logger.warning("没有rg_pos_t数据，使用零向量")
             
             # 构建标准AMP观测
             amp_obs = self._build_standard_amp_obs(
@@ -443,18 +348,20 @@ class AMPMotionTracking(LeggedRobotMotionTracking):
             valid_key_body_ids = []
             
             for idx in self._key_body_ids:
-                if idx < num_bodies:
-                    valid_key_body_ids.append(idx)
+                if isinstance(idx, torch.Tensor):
+                    idx = idx.item()
+                safe_idx = min(idx, num_bodies - 1)
+                valid_key_body_ids.append(safe_idx)
             
             if len(valid_key_body_ids) > 0:
                 valid_indices = torch.tensor(valid_key_body_ids, device=self.device)
                 key_body_pos = all_body_pos[:, valid_indices, :]
                 
-                # 如果有效索引数量不足，用零向量补充
+                # 如果索引数量不足，复制最后一个
                 if len(valid_key_body_ids) < len(self._key_body_ids):
                     missing_count = len(self._key_body_ids) - len(valid_key_body_ids)
-                    zeros = torch.zeros(self.num_envs, missing_count, 3, device=self.device)
-                    key_body_pos = torch.cat([key_body_pos, zeros], dim=1)
+                    last_pos = key_body_pos[:, -1:, :].repeat(1, missing_count, 1)
+                    key_body_pos = torch.cat([key_body_pos, last_pos], dim=1)
             else:
                 key_body_pos = torch.zeros(self.num_envs, len(self._key_body_ids), 3, device=self.device)
             
@@ -477,56 +384,59 @@ class AMPMotionTracking(LeggedRobotMotionTracking):
             return self.amp_obs_buf
 
     def get_expert_amp_observations(self, num_samples=None):
-        """获取专家AMP观测 - 使用缓存系统优化"""
+        """获取专家AMP观测 - 完全参考版本1的简单方法"""
         if num_samples is None:
             num_samples = self.num_envs
         
         try:
-            # 从缓存中获取数据
-            if hasattr(self, 'expert_data_cache') and self.expert_data_cache.is_cache_ready():
-                expert_data = self.expert_data_cache.sample(num_samples)
-                
-                if expert_data is not None and expert_data.shape[0] > 0:
-                    # 如果缓存数据不足，补充生成
-                    if expert_data.shape[0] < num_samples:
-                        additional_needed = num_samples - expert_data.shape[0]
-                        additional_data = self._generate_expert_batch(additional_needed)
-                        
-                        if additional_data is not None:
-                            # 将新生成的数据添加到缓存
-                            self.expert_data_cache.add_data(additional_data)
-                            # 组合数据
-                            expert_data = torch.cat([expert_data, additional_data[:additional_needed]], dim=0)
-                    
-                    # 确保数据质量
-                    if torch.isnan(expert_data).any() or torch.isinf(expert_data).any():
-                        logger.error("缓存的expert数据包含NaN或Inf！")
-                        expert_data = self._generate_fallback_data(num_samples)
-                    
-                    logger.debug(f"从缓存获取expert观测: shape={expert_data.shape}, "
-                                f"mean={expert_data.mean().item():.4f}, "
-                                f"std={expert_data.std().item():.4f}")
-                    
-                    return expert_data
+            # 如果expert数据还没有加载，尝试加载
+            if not self.expert_data_loaded:
+                self.expert_amp_loader = self._load_expert_amp_data_simple()
+                self.expert_data_loaded = True
             
-            # 如果缓存不可用，生成新数据
-            logger.warning("Expert数据缓存不可用，生成新数据")
-            expert_data = self._generate_expert_batch(num_samples)
+            expert_data_size = len(self.expert_amp_loader)
             
-            if expert_data is None or expert_data.shape[0] == 0:
-                logger.error("无法生成expert数据，使用fallback")
-                return self._generate_fallback_data(num_samples)
+            if expert_data_size == 0:
+                logger.error("Expert数据为空！")
+                amp_obs_dim = self.config.robot.algo_obs_dim_dict["amp_obs"]
+                fallback_data = torch.zeros(num_samples, amp_obs_dim, device=self.device)
+                return fallback_data
             
-            return expert_data
+            # 检查数据质量
+            if torch.isnan(self.expert_amp_loader).any() or torch.isinf(self.expert_amp_loader).any():
+                logger.error("Expert数据包含NaN或Inf！")
+                amp_obs_dim = self.config.robot.algo_obs_dim_dict["amp_obs"]
+                fallback_data = torch.zeros(num_samples, amp_obs_dim, device=self.device)
+                return fallback_data
+            
+            if expert_data_size < num_samples:
+                logger.debug(f"Expert数据不足: {expert_data_size} < {num_samples}，使用重复采样")
+                # 重复采样
+                repeats = (num_samples // expert_data_size) + 1
+                expanded_data = self.expert_amp_loader.repeat(repeats, 1)
+                indices = torch.randperm(len(expanded_data))[:num_samples]
+                sampled_data = expanded_data[indices]
+            else:
+                # 随机采样
+                indices = torch.randperm(expert_data_size)[:num_samples]
+                sampled_data = self.expert_amp_loader[indices]
+            
+            # 验证采样数据
+            if torch.isnan(sampled_data).any() or torch.isinf(sampled_data).any():
+                logger.error("采样的expert数据包含NaN或Inf！")
+                amp_obs_dim = self.config.robot.algo_obs_dim_dict["amp_obs"]
+                return torch.zeros(num_samples, amp_obs_dim, device=self.device)
+            
+            logger.debug(f"成功获取expert观测: shape={sampled_data.shape}, "
+                        f"mean={sampled_data.mean().item():.4f}, "
+                        f"std={sampled_data.std().item():.4f}")
+            
+            return sampled_data
             
         except Exception as e:
             logger.error(f"获取expert观测时出错: {e}")
-            return self._generate_fallback_data(num_samples)
-
-    def _generate_fallback_data(self, num_samples):
-        """生成fallback数据"""
-        amp_obs_dim = self.config.robot.algo_obs_dim_dict["amp_obs"]
-        return torch.zeros(num_samples, amp_obs_dim, device=self.device)
+            amp_obs_dim = self.config.robot.algo_obs_dim_dict["amp_obs"]
+            return torch.zeros(num_samples, amp_obs_dim, device=self.device)
 
     def _pre_compute_observations_callback(self):
         """在计算观测之前的回调，确保AMP观测被更新"""
@@ -554,39 +464,39 @@ class AMPMotionTracking(LeggedRobotMotionTracking):
         logger.info(f"AMP观测维度: {expected_amp_dim}")
 
     def set_is_evaluating(self):
-        """设置为评估模式 - AMP特殊处理"""
+        """设置为评估模式 - 完全参考版本1"""
         logger.info("🔄 AMPMotionTracking 切换到评估模式")
         
         # 调用父类方法
         super().set_is_evaluating()
         
         # 重新配置AMP数据为评估模式
-        if hasattr(self, 'expert_data_cache'):
-            logger.info("重新配置AMP数据缓存为评估模式")
+        if self.amp_data_initialized:
+            logger.info("重新配置AMP数据为评估模式")
             try:
-                # 清空缓存并重新预加载
-                self.expert_data_cache.cache_index = 0
-                self.expert_data_cache.cache_filled = False
-                self._preload_expert_data_async()
-                logger.info("✅ AMP数据缓存已切换到评估模式")
+                # 重新加载数据（使用相同的简单方法）
+                self.expert_amp_loader = self._load_expert_amp_data_simple()
+                self.expert_data_loaded = True
+                logger.info(f"✅ AMP数据已切换到评估模式，expert数据形状: {self.expert_amp_loader.shape}")
             except Exception as e:
                 logger.error(f"❌ AMP评估模式重新初始化失败: {e}")
+                # 使用安全的fallback
+                amp_obs_dim = self.config.robot.algo_obs_dim_dict["amp_obs"]
+                self.expert_amp_loader = torch.zeros(100, amp_obs_dim, device=self.device)
+                self.expert_data_loaded = True
 
     def _post_physics_step(self):
-        """重写后处理步骤"""
+        """重写后处理步骤，参考版本1"""
         super()._post_physics_step()
         
-        # 定期补充expert数据缓存
-        if hasattr(self, 'expert_data_cache') and self.common_step_counter % 1000 == 0:
+        # 延迟加载expert数据（如果还没有正确加载）
+        if not self.expert_data_loaded and self.common_step_counter % 1000 == 0:
             try:
-                if not self.expert_data_cache.is_cache_ready():
-                    # 异步补充缓存
-                    additional_data = self._generate_expert_batch(500)
-                    if additional_data is not None:
-                        self.expert_data_cache.add_data(additional_data)
-                        logger.debug(f"补充expert缓存数据: {additional_data.shape[0]} 样本")
+                self.expert_amp_loader = self._load_expert_amp_data_simple()
+                self.expert_data_loaded = True
+                logger.info(f"延迟加载expert数据完成，形状: {self.expert_amp_loader.shape}")
             except Exception as e:
-                logger.debug(f"补充expert缓存失败: {e}")
+                logger.debug(f"延迟加载expert数据失败: {e}")
 
     def _reset_tasks_callback(self, env_ids):
         if len(env_ids) == 0:
